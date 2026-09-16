@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.aws-sam/
+backend/samconfig.toml
+.env
+.env.local
+frontend/.vercel
+frontend/dist

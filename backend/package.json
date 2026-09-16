@@ -1,0 +1,21 @@
+{
+  "name": "sla-dashboard-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.14.9",
+    "@types/pg": "^8.11.6",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5.3",
+    "vitest": "^1.6.0"
+  }
+}
