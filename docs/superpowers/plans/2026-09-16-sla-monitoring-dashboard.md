@@ -2859,6 +2859,105 @@ git commit -m "style: polish dashboard visual design"
 
 ---
 
+## Amendment (2026-09-17, fourth): surface stats/logs load failures in the UI
+
+Found via a live Playwright check against the local backend with no database configured: `App.tsx`'s `loadStats`/`loadLogs` (written in Task 19, byte-identical to the plan's own given code) have no `catch` block. When `fetchStats`/`fetchLogs` throw, the error becomes an unhandled promise rejection — visible only in the browser console — while the UI silently shows an empty stats/logs section forever, with no indication anything failed. The upload flow already has this right (`UploadPanel` catches and displays "Upload failed: ..."); stats/logs should behave the same way.
+
+### Task F: catch and surface stats/logs errors
+
+**Files:**
+- Modify: `frontend/src/App.tsx`
+- Modify: `frontend/src/App.css` (add one class)
+
+**Interfaces:** none new — `StatsPanel`/`LogsTable`'s prop signatures are unchanged; the error message renders in `App.tsx` itself, above each section.
+
+- [ ] **Step 1: Add error state and catch blocks in `frontend/src/App.tsx`**
+
+Add two new pieces of state alongside the existing `stats`/`logs` state:
+
+```typescript
+const [statsError, setStatsError] = useState<string | null>(null);
+const [logsError, setLogsError] = useState<string | null>(null);
+```
+
+Change `loadStats` and `loadLogs` to clear the error at the start of each attempt and set it on failure:
+
+```typescript
+const loadStats = useCallback(async () => {
+  setStatsLoading(true);
+  setStatsError(null);
+  try {
+    setStats(await fetchStats(from || undefined, to || undefined));
+  } catch (err) {
+    setStatsError((err as Error).message);
+  } finally {
+    setStatsLoading(false);
+  }
+}, [from, to]);
+
+const loadLogs = useCallback(async () => {
+  setLogsLoading(true);
+  setLogsError(null);
+  try {
+    setLogs(await fetchLogs({ from: from || undefined, to: to || undefined, service: service || undefined, page, pageSize: PAGE_SIZE }));
+  } catch (err) {
+    setLogsError((err as Error).message);
+  } finally {
+    setLogsLoading(false);
+  }
+}, [from, to, service, page]);
+```
+
+- [ ] **Step 2: Render the errors in the JSX**
+
+In the returned markup, add an error message directly above each affected section:
+
+```tsx
+{statsError && <p className="section-error" role="alert">Failed to load stats: {statsError}</p>}
+<StatsPanel stats={stats} loading={statsLoading} />
+```
+
+```tsx
+{logsError && <p className="section-error" role="alert">Failed to load logs: {logsError}</p>}
+<LogsTable
+  logs={logs}
+  ...
+```
+
+(Keep every existing prop on `LogsTable` exactly as-is — only add the new `<p>` above it.)
+
+- [ ] **Step 3: Add the `.section-error` style to `frontend/src/App.css`**
+
+```css
+.section-error {
+  padding: 10px 16px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+```
+
+- [ ] **Step 4: Verify with Playwright against the local backend with no `DATABASE_URL`**
+
+Start the local backend (`cd backend && PORT=<pick an unused port> npm run dev`) and frontend (`cd frontend && npm run dev`) with `frontend/.env.local` pointing at that port. Navigate to the page. Confirm: a red "Failed to load stats: ..." message appears where the stats panel would otherwise be silently empty, and a red "Failed to load logs: ..." message appears above the logs table — both showing the real connection error text (proof Task D's fix is visible end-to-end, not just at the API layer). Check the browser console — the same errors may still appear there (that's fine/expected), but they must now also be visible on the page itself. Stop both servers when done.
+
+- [ ] **Step 5: Typecheck and build**
+
+Run: `cd frontend && npm run typecheck && npm run build`
+Expected: no errors, no stray files (per Task D's fix).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add frontend/src/App.tsx frontend/src/App.css
+git commit -m "fix: surface stats/logs load failures in the UI instead of failing silently"
+```
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).
