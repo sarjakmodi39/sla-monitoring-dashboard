@@ -1,6 +1,7 @@
 name = "sla-dashboard-backend"
 main = "src/worker/index.ts"
-compatibility_date = "2024-09-01"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true

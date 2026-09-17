@@ -6,3 +6,5 @@ backend/samconfig.toml
 .env.local
 frontend/.vercel
 frontend/dist
+.dev.vars
+backend/.wrangler/
