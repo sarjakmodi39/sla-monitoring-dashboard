@@ -1,0 +1,12 @@
+body { font-family: system-ui, sans-serif; margin: 0; background: #f7f7f8; color: #1a1a1a; }
+.app { max-width: 1000px; margin: 0 auto; padding: 24px; }
+.upload-panel { margin-bottom: 16px; padding: 16px; background: white; border-radius: 8px; }
+.banner { padding: 8px 12px; background: #e6f4ea; border-radius: 6px; }
+.stats-panel { margin-bottom: 24px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }
+.stats-card { padding: 12px; background: white; border-radius: 8px; border: 1px solid #ddd; }
+.stats-card.breach { border-color: #d33; background: #fdecea; }
+.logs-table table { width: 100%; border-collapse: collapse; background: white; }
+.logs-table th, .logs-table td { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: left; font-size: 14px; }
+.logs-filters { display: flex; gap: 16px; margin-bottom: 12px; }
+.pagination { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
