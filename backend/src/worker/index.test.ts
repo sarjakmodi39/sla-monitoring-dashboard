@@ -8,14 +8,15 @@ import worker from './index';
 import { handleUpload } from '../upload-handler/index';
 import { getServiceStats } from '../query-handler/stats';
 import { getLogs } from '../query-handler/logs';
+import type { Env } from './index';
 
-const env = { DATABASE_URL: 'postgres://test' };
+const env: Env = { DATABASE_URL: 'postgres://test' };
 
 describe('worker fetch', () => {
   it('routes POST /upload to handleUpload with the request body text', async () => {
-    (handleUpload as any).mockResolvedValue({ statusCode: 200, body: { rows_received: 1 } });
+    vi.mocked(handleUpload).mockResolvedValue({ statusCode: 200, body: { rows_received: 1 } });
     const req = new Request('https://worker.example/upload', { method: 'POST', body: 'a,b\n1,2' });
-    const res = await worker.fetch(req, env as any);
+    const res = await worker.fetch(req, env);
     expect(handleUpload).toHaveBeenCalledWith('a,b\n1,2');
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ rows_received: 1 });
@@ -23,31 +24,31 @@ describe('worker fetch', () => {
   });
 
   it('routes GET /stats with parsed query params', async () => {
-    (getServiceStats as any).mockResolvedValue({ overall: {}, by_service: [] });
+    vi.mocked(getServiceStats).mockResolvedValue({ overall: {}, by_service: [] });
     const req = new Request('https://worker.example/stats?from=2025-05-01&to=2025-05-02');
-    const res = await worker.fetch(req, env as any);
+    const res = await worker.fetch(req, env);
     expect(getServiceStats).toHaveBeenCalledWith('2025-05-01', '2025-05-02');
     expect(res.status).toBe(200);
   });
 
   it('routes GET /logs with parsed pagination', async () => {
-    (getLogs as any).mockResolvedValue({ rows: [], total: 0, page: 2, page_size: 25 });
+    vi.mocked(getLogs).mockResolvedValue({ rows: [], total: 0, page: 2, page_size: 25 });
     const req = new Request('https://worker.example/logs?service=svc-auth&page=2&page_size=25');
-    const res = await worker.fetch(req, env as any);
+    const res = await worker.fetch(req, env);
     expect(getLogs).toHaveBeenCalledWith({ from: undefined, to: undefined, service: 'svc-auth', page: 2, pageSize: 25 });
     expect(res.status).toBe(200);
   });
 
   it('returns 404 for an unknown route', async () => {
     const req = new Request('https://worker.example/nope');
-    const res = await worker.fetch(req, env as any);
+    const res = await worker.fetch(req, env);
     expect(res.status).toBe(404);
   });
 
   it('returns 400 when a downstream call throws', async () => {
-    (getServiceStats as any).mockRejectedValue(new Error('boom'));
+    vi.mocked(getServiceStats).mockRejectedValue(new Error('boom'));
     const req = new Request('https://worker.example/stats');
-    const res = await worker.fetch(req, env as any);
+    const res = await worker.fetch(req, env);
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'boom' });
   });
