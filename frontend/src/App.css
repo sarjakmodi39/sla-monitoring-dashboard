@@ -88,6 +88,16 @@ body {
   margin-bottom: 20px;
 }
 
+.section-error {
+  padding: 10px 16px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+
 .stats-panel {
   margin-bottom: 24px;
 }

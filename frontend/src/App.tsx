@@ -14,14 +14,19 @@ export default function App() {
 
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogsResponse | null>(null);
   const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
   const loadStats = useCallback(async () => {
     setStatsLoading(true);
+    setStatsError(null);
     try {
       setStats(await fetchStats(from || undefined, to || undefined));
+    } catch (err) {
+      setStatsError((err as Error).message);
     } finally {
       setStatsLoading(false);
     }
@@ -29,8 +34,11 @@ export default function App() {
 
   const loadLogs = useCallback(async () => {
     setLogsLoading(true);
+    setLogsError(null);
     try {
       setLogs(await fetchLogs({ from: from || undefined, to: to || undefined, service: service || undefined, page, pageSize: PAGE_SIZE }));
+    } catch (err) {
+      setLogsError((err as Error).message);
     } finally {
       setLogsLoading(false);
     }
@@ -52,7 +60,9 @@ export default function App() {
         }}
       />
       {banner && <p className="banner">{banner}</p>}
+      {statsError && <p className="section-error" role="alert">Failed to load stats: {statsError}</p>}
       <StatsPanel stats={stats} loading={statsLoading} />
+      {logsError && <p className="section-error" role="alert">Failed to load logs: {logsError}</p>}
       <LogsTable
         logs={logs}
         loading={logsLoading}
