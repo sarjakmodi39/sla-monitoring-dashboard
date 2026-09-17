@@ -3052,6 +3052,745 @@ Flag as an honest "what I'd verify further" item: Cloudflare's own tutorial for 
 
 ---
 
+## Amendment (2026-09-17, sixth): whole-branch code review found 3 Critical + 6 Important issues
+
+A comprehensive review (opus model, `requesting-code-review` template, base `c82fd64` head `0face44`) found three bugs that would break the deployed app outright, and six more affecting correctness of the core SLA numbers. Full findings below, split into two tasks.
+
+### Task H: fix Postgres parameter limit and Workers connection lifecycle (Critical)
+
+**Files:**
+- Modify: `backend/src/shared/db.ts` (replace `Pool`/`getPool` with per-request `Client`/`withClient`, batch inserts)
+- Modify: `backend/src/shared/db.test.ts` (rewrite mocks for `Client`, add a batching test)
+- Modify: `backend/src/query-handler/stats.ts` (use `withClient` instead of `getPool`)
+- Modify: `backend/src/query-handler/stats.test.ts` (update mock target)
+- Modify: `backend/src/query-handler/logs.ts` (use `withClient` instead of `getPool`)
+- Modify: `backend/src/query-handler/logs.test.ts` (update mock target)
+- Modify: `backend/src/worker/index.ts` (add CORS headers + OPTIONS preflight handling)
+- Modify: `backend/src/worker/index.test.ts` (add CORS/OPTIONS test coverage)
+
+**Why:** (1) A single multi-row `INSERT` puts 9 bind parameters per row into one statement; Postgres's wire protocol caps bind parameters at 65,535. Two of the five provided sample CSVs (21-day and 30-day) exceed that. (2) Cloudflare Workers scope sockets to the request that created them — a `pg.Pool` created once at module scope and reused across requests throws `Cannot perform I/O on behalf of a different request` on the second request an isolate handles. The fix for both: batch inserts into chunks of 1,000 rows, and create+connect+close a `Client` fully within each call rather than a long-lived module-scope `Pool`. (3) The deployed frontend (Vercel) and backend (Workers) will be on different origins with no CORS headers anywhere in the codebase — every browser request would be blocked. `POST /upload` sends `Content-Type: text/csv`, which isn't CORS-safelisted, so the browser sends an `OPTIONS` preflight first; today that 404s.
+
+**Interfaces:**
+- Removes: `getPool()` (no longer exported).
+- Produces: `withClient<T>(fn: (client: Client) => Promise<T>): Promise<T>` — connects a fresh `pg.Client`, runs `fn`, always closes the client afterward (even on error), returns `fn`'s result. Consumed by `insertCleanedRows`, `getServiceStats`, `getLogs`.
+- `insertCleanedRows`, `getServiceStats`, `getLogs` keep their existing exported signatures unchanged — only their internal DB-access pattern changes, so `upload-handler/index.ts` and `worker/index.ts`'s calls to them need no changes beyond what's listed above.
+
+- [ ] **Step 1: Rewrite `backend/src/shared/db.ts`**
+
+```typescript
+import { Client } from 'pg';
+import type { CleanedCheckRow } from './types';
+
+const BATCH_SIZE = 1000;
+
+export async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
+}
+
+export async function insertCleanedRows(
+  rows: CleanedCheckRow[],
+): Promise<{ inserted: number; duplicates: number }> {
+  if (rows.length === 0) return { inserted: 0, duplicates: 0 };
+
+  return withClient(async (client) => {
+    let inserted = 0;
+
+    for (let offset = 0; offset < rows.length; offset += BATCH_SIZE) {
+      const batch = rows.slice(offset, offset + BATCH_SIZE);
+      const values: unknown[] = [];
+      const placeholders = batch
+        .map((r, i) => {
+          const base = i * 9;
+          values.push(
+            r.service_id, r.service_name, r.ts, r.status_code,
+            r.latency_ms, r.agent, r.region, r.data_quality_flag, r.raw_line,
+          );
+          return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9})`;
+        })
+        .join(',');
+
+      const sql = `
+        insert into checks (service_id, service_name, ts, status_code, latency_ms, agent, region, data_quality_flag, raw_line)
+        values ${placeholders}
+        on conflict (service_id, ts, agent) do nothing
+        returning id
+      `;
+
+      const result = await client.query(sql, values);
+      inserted += result.rowCount ?? 0;
+    }
+
+    return { inserted, duplicates: rows.length - inserted };
+  });
+}
+```
+
+- [ ] **Step 2: Rewrite `backend/src/shared/db.test.ts`**
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { CleanedCheckRow } from './types';
+
+const connectMock = vi.fn();
+const endMock = vi.fn();
+const queryMock = vi.fn();
+vi.mock('pg', () => ({
+  Client: vi.fn(() => ({ connect: connectMock, query: queryMock, end: endMock })),
+}));
+
+function makeRow(i: number): CleanedCheckRow {
+  return {
+    service_id: `svc-${i}`,
+    service_name: 'test-api',
+    ts: '2025-05-13T12:45:00.000Z',
+    status_code: 200,
+    latency_ms: 100,
+    agent: 'agent-1',
+    region: 'ap-south-1',
+    data_quality_flag: null,
+    raw_line: 'raw',
+  };
+}
+
+beforeEach(() => {
+  connectMock.mockReset();
+  queryMock.mockReset();
+  endMock.mockReset();
+});
+
+describe('insertCleanedRows', () => {
+  it('returns zero counts for an empty batch without connecting', async () => {
+    const { insertCleanedRows } = await import('./db');
+    const result = await insertCleanedRows([]);
+    expect(result).toEqual({ inserted: 0, duplicates: 0 });
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it('builds a parameterized multi-row insert and reports duplicates from the row-count gap', async () => {
+    queryMock.mockResolvedValue({ rowCount: 1 });
+    const { insertCleanedRows } = await import('./db');
+    const result = await insertCleanedRows([makeRow(1), makeRow(2)]);
+
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    const [sql, values] = queryMock.mock.calls[0];
+    expect(sql).toContain('on conflict (service_id, ts, agent) do nothing');
+    expect(values).toHaveLength(18);
+    expect(endMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ inserted: 1, duplicates: 1 });
+  });
+
+  it('splits more than 1000 rows into multiple batched queries over one connection', async () => {
+    queryMock.mockResolvedValueOnce({ rowCount: 1000 }).mockResolvedValueOnce({ rowCount: 500 });
+    const { insertCleanedRows } = await import('./db');
+    const rows = Array.from({ length: 1500 }, (_, i) => makeRow(i));
+    const result = await insertCleanedRows(rows);
+
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock.mock.calls[0][1]).toHaveLength(1000 * 9);
+    expect(queryMock.mock.calls[1][1]).toHaveLength(500 * 9);
+    expect(endMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ inserted: 1500, duplicates: 0 });
+  });
+
+  it('ends the client even if a query throws', async () => {
+    queryMock.mockRejectedValue(new Error('boom'));
+    const { insertCleanedRows } = await import('./db');
+    await expect(insertCleanedRows([makeRow(1)])).rejects.toThrow('boom');
+    expect(endMock).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+- [ ] **Step 3: Run the new/changed test file**
+
+Run: `cd backend && npx vitest run src/shared/db.test.ts`
+Expected: all 4 tests PASS.
+
+- [ ] **Step 4: Update `backend/src/query-handler/stats.ts` to use `withClient`**
+
+Change the import from `import { getPool } from '../shared/db';` to `import { withClient } from '../shared/db';`, and wrap the function body:
+
+```typescript
+export async function getServiceStats(
+  from?: string,
+  to?: string,
+): Promise<{ overall: OverallStats; by_service: ServiceStats[] }> {
+  const { start, end } = toRangeBounds(from, to);
+
+  return withClient(async (client) => {
+    const aggregate = await client.query(
+      `select
+         service_id, service_name,
+         count(*) filter (where status_code != 999) as total_checks,
+         count(*) filter (where status_code < 400 and status_code != 999) as up_checks,
+         count(*) filter (where status_code >= 400 and status_code != 999) as down_checks,
+         count(*) filter (where status_code = 999) as check_failures,
+         avg(latency_ms) filter (where status_code != 999) as avg_latency_ms,
+         percentile_cont(0.95) within group (order by latency_ms) filter (where status_code != 999) as p95_latency_ms
+       from checks
+       where ts >= $1 and ts < $2
+       group by service_id, service_name`,
+      [start, end],
+    );
+
+    const incidents = await client.query(
+      `with deduped as (
+         select distinct service_id, ts, status_code
+         from checks
+         where ts >= $1 and ts < $2 and status_code != 999
+       ),
+       flagged as (
+         select service_id, ts,
+           (status_code >= 400) as is_down,
+           lag(status_code >= 400) over (partition by service_id order by ts) as prev_down
+         from deduped
+       )
+       select service_id, count(*) as incident_count
+       from flagged
+       where is_down and (prev_down is distinct from true)
+       group by service_id`,
+      [start, end],
+    );
+
+    const incidentCounts = new Map<string, number>(
+      incidents.rows.map((r: { service_id: string; incident_count: string }) => [
+        r.service_id,
+        Number(r.incident_count),
+      ]),
+    );
+
+    const byService: ServiceStats[] = aggregate.rows.map((r: {
+      service_id: string; service_name: string; total_checks: string;
+      up_checks: string; down_checks: string; check_failures: string;
+      avg_latency_ms: string | null; p95_latency_ms: string | null;
+    }) => {
+      const totalChecks = Number(r.total_checks);
+      const upChecks = Number(r.up_checks);
+      const downChecks = Number(r.down_checks);
+      const uptimePct = totalChecks === 0 ? 100 : Math.round((upChecks / totalChecks) * 100000) / 1000;
+
+      return {
+        service_id: r.service_id,
+        service_name: r.service_name,
+        uptime_pct: uptimePct,
+        breaches_slo: uptimePct < SLO_THRESHOLD_PCT,
+        incident_count: incidentCounts.get(r.service_id) ?? 0,
+        downtime_minutes: downChecks * CHECK_INTERVAL_MINUTES,
+        avg_latency_ms: r.avg_latency_ms === null ? null : Math.round(Number(r.avg_latency_ms)),
+        p95_latency_ms: r.p95_latency_ms === null ? null : Math.round(Number(r.p95_latency_ms)),
+        check_failures: Number(r.check_failures),
+      };
+    });
+
+    return {
+      overall: {
+        total_services: byService.length,
+        services_breaching_slo: byService.filter((s) => s.breaches_slo).length,
+      },
+      by_service: byService,
+    };
+  });
+}
+```
+
+(This also fixes Task I's incident-count bug in the same edit, since it touches the same query — see Task I item 4 for why the CTE changed shape: `deduped` collapses duplicate `(service_id, ts)` pairs from the `agent-1`/`agent-2` overlap before windowing, and 999 rows are filtered out before computing `is_down` rather than being folded into its boolean expression.)
+
+- [ ] **Step 5: Update `backend/src/query-handler/stats.test.ts`'s mock**
+
+Change the mock from mocking `getPool` to mocking `withClient`:
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const queryMock = vi.fn();
+vi.mock('../shared/db', () => ({
+  withClient: (fn: (client: { query: typeof queryMock }) => unknown) => fn({ query: queryMock }),
+}));
+
+beforeEach(() => {
+  queryMock.mockReset();
+});
+
+describe('getServiceStats', () => {
+  it('merges the aggregate query and the incident-count query per service, and applies the 99.9% threshold', async () => {
+    queryMock
+      .mockResolvedValueOnce({
+        rows: [{
+          service_id: 'svc-auth', service_name: 'auth-api',
+          total_checks: '999', up_checks: '990', down_checks: '9', check_failures: '1',
+          avg_latency_ms: '150.5', p95_latency_ms: '300',
+        }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{ service_id: 'svc-auth', incident_count: '2' }],
+      });
+
+    const { getServiceStats } = await import('./stats');
+    const result = await getServiceStats('2025-05-01', '2025-05-02');
+
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(result.by_service).toHaveLength(1);
+    expect(result.by_service[0]).toMatchObject({
+      service_id: 'svc-auth',
+      incident_count: 2,
+      check_failures: 1,
+      downtime_minutes: 135,
+      breaches_slo: true,
+    });
+  });
+});
+```
+
+- [ ] **Step 6: Run the changed test file**
+
+Run: `cd backend && npx vitest run src/query-handler/stats.test.ts`
+Expected: PASS.
+
+- [ ] **Step 7: Update `backend/src/query-handler/logs.ts` to use `withClient`**
+
+Change the import from `import { getPool } from '../shared/db';` to `import { withClient } from '../shared/db';`, and wrap the body:
+
+```typescript
+export async function getLogs(params: {
+  from?: string;
+  to?: string;
+  service?: string;
+  page: number;
+  pageSize: number;
+}): Promise<{ rows: LogRow[]; total: number; page: number; page_size: number }> {
+  const { start, end } = toRangeBounds(params.from, params.to);
+  const conditions = ['ts >= $1', 'ts < $2'];
+  const values: unknown[] = [start, end];
+
+  if (params.service) {
+    values.push(params.service);
+    conditions.push(`service_id = $${values.length}`);
+  }
+
+  const where = `where ${conditions.join(' and ')}`;
+  const offset = (params.page - 1) * params.pageSize;
+
+  const dataValues = [...values, params.pageSize, offset];
+  const dataSql = `
+    select id, service_id, service_name, ts, status_code, latency_ms, agent, region, data_quality_flag
+    from checks
+    ${where}
+    order by ts desc
+    limit $${dataValues.length - 1} offset $${dataValues.length}
+  `;
+
+  return withClient(async (client) => {
+    const dataResult = await client.query(dataSql, dataValues);
+    const countResult = await client.query(`select count(*) from checks ${where}`, values);
+
+    return {
+      rows: dataResult.rows,
+      total: Number(countResult.rows[0].count),
+      page: params.page,
+      page_size: params.pageSize,
+    };
+  });
+}
+```
+
+- [ ] **Step 8: Update `backend/src/query-handler/logs.test.ts`'s mock**
+
+Same mock-target change as Step 5, adapted to this file's existing test:
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const queryMock = vi.fn();
+vi.mock('../shared/db', () => ({
+  withClient: (fn: (client: { query: typeof queryMock }) => unknown) => fn({ query: queryMock }),
+}));
+
+beforeEach(() => {
+  queryMock.mockReset();
+});
+
+describe('getLogs', () => {
+  it('filters by service and paginates, returning total from a separate count query', async () => {
+    queryMock
+      .mockResolvedValueOnce({ rows: [{ id: 1, service_id: 'svc-auth' }] })
+      .mockResolvedValueOnce({ rows: [{ count: '42' }] });
+
+    const { getLogs } = await import('./logs');
+    const result = await getLogs({ service: 'svc-auth', page: 2, pageSize: 10 });
+
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    const [dataSql, dataValues] = queryMock.mock.calls[0];
+    expect(dataSql).toContain('service_id = $');
+    expect(dataSql).toContain('limit');
+    expect(dataValues).toContain('svc-auth');
+    expect(result).toEqual({ rows: [{ id: 1, service_id: 'svc-auth' }], total: 42, page: 2, page_size: 10 });
+  });
+});
+```
+
+- [ ] **Step 9: Run the changed test file**
+
+Run: `cd backend && npx vitest run src/query-handler/logs.test.ts`
+Expected: PASS.
+
+- [ ] **Step 10: Add CORS headers and OPTIONS handling to `backend/src/worker/index.ts`**
+
+Add a constant near the top and change the `json()` helper and the top of `fetch`:
+
+```typescript
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+  });
+}
+```
+
+At the very start of `fetch`, before the existing `const url = new URL(...)` line, add:
+
+```typescript
+if (request.method === 'OPTIONS') {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+```
+
+(This task doesn't change the routing logic below that point — Task I does, in the same file. If you're doing both tasks in one sitting, Task I's Step for this file supersedes the routing body; if doing Task H alone, leave the rest of `fetch` as it currently is.)
+
+- [ ] **Step 11: Add a test for OPTIONS/CORS to `backend/src/worker/index.test.ts`**
+
+Add one new test to the existing `describe('worker fetch', ...)` block:
+
+```typescript
+  it('responds to OPTIONS preflight with CORS headers and no body', async () => {
+    const req = new Request('https://worker.example/upload', { method: 'OPTIONS' });
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+```
+
+Also add, to each of the existing route tests, a one-line assertion that the response carries the CORS header (pick at least the `/stats` test): `expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');`
+
+- [ ] **Step 12: Run the full backend suite**
+
+Run: `cd backend && npm test`
+Expected: all pass (test count will be one higher than before, from the new OPTIONS test).
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add backend/src/shared/db.ts backend/src/shared/db.test.ts backend/src/query-handler/stats.ts backend/src/query-handler/stats.test.ts backend/src/query-handler/logs.ts backend/src/query-handler/logs.test.ts backend/src/worker/index.ts backend/src/worker/index.test.ts
+git commit -m "fix: batch inserts under Postgres param limit, use per-request pg Client for Workers, add CORS"
+```
+
+### Task I: input validation, error status codes, flag-counting accuracy (Important)
+
+**Files:**
+- Modify: `backend/src/upload-handler/parse.ts` (stricter status-code validation)
+- Modify: `backend/src/upload-handler/parse.test.ts` (add a case)
+- Modify: `backend/src/upload-handler/clean.ts` (count every applicable data-quality flag, not just the stored one)
+- Modify: `backend/src/upload-handler/clean.test.ts` (fix the now-outdated assertion, add a status-code case)
+- Modify: `backend/src/worker/index.ts` (400 for validation errors vs 500 for real server failures; validate `page`/`page_size`/date params)
+- Modify: `backend/src/worker/index.test.ts` (update the "downstream throws" test's expected status; add validation-error tests)
+- Modify: `backend/src/shared/db.ts` (one-line comment on the `ssl` option, no behavior change)
+
+Depends on Task H being done first (both touch `backend/src/worker/index.ts`'s `fetch` body) — do Task H first, then this one.
+
+- [ ] **Step 1: Write the failing test for stricter status-code parsing**
+
+Add to `backend/src/upload-handler/parse.test.ts`, inside the existing `describe('parseCsv', ...)` block or as its own new block — this project doesn't currently have a dedicated status-code parser function, so instead add this case to `clean.test.ts`'s `describe('cleanRow', ...)` block:
+
+```typescript
+  it('returns null when status_code is blank rather than treating it as 0', () => {
+    const result = cleanRow({ ...base, status_code: '' }, 'raw-line');
+    expect(result).toBeNull();
+  });
+
+  it('returns null when status_code has non-digit characters', () => {
+    const result = cleanRow({ ...base, status_code: '2xx' }, 'raw-line');
+    expect(result).toBeNull();
+  });
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cd backend && npx vitest run src/upload-handler/clean.test.ts`
+Expected: FAIL (both new cases) — currently `Number('')` is `0` and passes through; `Number('2xx')` is `NaN` and already correctly returns null, so only the blank case should actually fail.
+
+- [ ] **Step 3: Fix the status-code check in `backend/src/upload-handler/clean.ts`**
+
+Change:
+
+```typescript
+  const statusCode = Number(raw.status_code);
+  if (isNaN(statusCode)) return null;
+```
+
+to:
+
+```typescript
+  if (!/^\d+$/.test(raw.status_code.trim())) return null;
+  const statusCode = Number(raw.status_code);
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cd backend && npx vitest run src/upload-handler/clean.test.ts`
+Expected: all PASS (including the two new cases and everything that already existed).
+
+- [ ] **Step 5: Fix flag under-counting — update the `cleanBatch` loop in `backend/src/upload-handler/clean.ts`**
+
+The `data_quality_flag` column stores only one flag per row (latency issues take priority over an epoch-timestamp issue, per the existing design). But a row can have both problems, and the upload response's `flags_summary` should report every issue actually found, not just whichever one got stored. Change the loop inside `cleanBatch`:
+
+```typescript
+export function cleanBatch(csvText: string): CleanResult {
+  const parsed = parseCsv(csvText);
+  const rows: CleanedCheckRow[] = [];
+  const flagsSummary: Record<DataQualityFlag, number> = {
+    epoch_timestamp: 0,
+    unit_converted: 0,
+    missing_latency: 0,
+    negative_latency_nulled: 0,
+  };
+  let skipped = 0;
+
+  for (const { raw, rawLine } of parsed) {
+    const row = cleanRow(raw, rawLine);
+    if (row === null) {
+      skipped++;
+      continue;
+    }
+    rows.push(row);
+
+    // Count every applicable issue for accurate reporting, even though only
+    // one is stored per row on `data_quality_flag` (latency issues take
+    // storage priority — see cleanRow).
+    const { wasEpoch } = normalizeTimestamp(raw.timestamp);
+    if (wasEpoch) flagsSummary.epoch_timestamp++;
+    const { flag: latencyFlag } = normalizeLatency(raw.latency, raw.latency_unit);
+    if (latencyFlag) flagsSummary[latencyFlag]++;
+  }
+
+  return { rows, rows_received: parsed.length, rows_skipped: skipped, flags_summary: flagsSummary };
+}
+```
+
+- [ ] **Step 6: Fix the now-outdated test assertion in `backend/src/upload-handler/clean.test.ts`**
+
+The existing `cleanBatch` test's `epochLine` (`'svc-search,search-api,1746938700,200,0.717,s,agent-1,ap-south-1'`) has BOTH an epoch timestamp and a seconds-unit latency. Change:
+
+```typescript
+    expect(result.flags_summary.unit_converted).toBe(1);
+    expect(result.flags_summary.epoch_timestamp).toBe(0);
+```
+
+to:
+
+```typescript
+    expect(result.flags_summary.unit_converted).toBe(1);
+    expect(result.flags_summary.epoch_timestamp).toBe(1);
+```
+
+- [ ] **Step 7: Run the full clean.test.ts file**
+
+Run: `cd backend && npx vitest run src/upload-handler/clean.test.ts`
+Expected: all PASS.
+
+- [ ] **Step 8: Add input validation and correct status codes to `backend/src/worker/index.ts`**
+
+Replace the whole file's routing body (keep the `CORS_HEADERS` constant, the `json()` helper, and the top-of-`fetch` OPTIONS check from Task H unchanged) with:
+
+```typescript
+import { handleUpload } from '../upload-handler/index';
+import { getServiceStats } from '../query-handler/stats';
+import { getLogs } from '../query-handler/logs';
+import { getErrorMessage } from '../shared/errors';
+
+export interface Env {
+  DATABASE_URL: string;
+}
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+  });
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseDateParam(value: string | null, name: string): string | undefined {
+  if (value === null) return undefined;
+  if (!DATE_RE.test(value)) throw new Error(`Invalid ${name}: expected YYYY-MM-DD`);
+  return value;
+}
+
+function parsePositiveInt(value: string | null, fallback: number, name: string): number {
+  if (value === null) return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`Invalid ${name}: expected a positive integer`);
+  return n;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    process.env.DATABASE_URL = env.DATABASE_URL;
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    const url = new URL(request.url);
+
+    if (request.method === 'POST' && url.pathname === '/upload') {
+      try {
+        const csvText = await request.text();
+        const result = await handleUpload(csvText);
+        return json(result.statusCode, result.body);
+      } catch (err) {
+        return json(500, { error: getErrorMessage(err) });
+      }
+    }
+
+    if (url.pathname === '/stats') {
+      let from: string | undefined;
+      let to: string | undefined;
+      try {
+        from = parseDateParam(url.searchParams.get('from'), 'from');
+        to = parseDateParam(url.searchParams.get('to'), 'to');
+      } catch (err) {
+        return json(400, { error: (err as Error).message });
+      }
+      try {
+        const data = await getServiceStats(from, to);
+        return json(200, data);
+      } catch (err) {
+        return json(500, { error: getErrorMessage(err) });
+      }
+    }
+
+    if (url.pathname === '/logs') {
+      let from: string | undefined;
+      let to: string | undefined;
+      let page: number;
+      let pageSize: number;
+      try {
+        from = parseDateParam(url.searchParams.get('from'), 'from');
+        to = parseDateParam(url.searchParams.get('to'), 'to');
+        page = parsePositiveInt(url.searchParams.get('page'), 1, 'page');
+        pageSize = parsePositiveInt(url.searchParams.get('page_size'), 50, 'page_size');
+      } catch (err) {
+        return json(400, { error: (err as Error).message });
+      }
+      try {
+        const data = await getLogs({
+          from,
+          to,
+          service: url.searchParams.get('service') ?? undefined,
+          page,
+          pageSize,
+        });
+        return json(200, data);
+      } catch (err) {
+        return json(500, { error: getErrorMessage(err) });
+      }
+    }
+
+    return json(404, { error: `Unknown route: ${url.pathname}` });
+  },
+};
+```
+
+- [ ] **Step 9: Update `backend/src/worker/index.test.ts`**
+
+The existing test "returns 400 when a downstream call throws" now needs a 500 (a real downstream/DB error is a server failure, not a client mistake):
+
+```typescript
+  it('returns 500 when a downstream call throws', async () => {
+    (getServiceStats as any).mockRejectedValue(new Error('boom'));
+    const req = new Request('https://worker.example/stats');
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'boom' });
+  });
+```
+
+Add two new validation tests:
+
+```typescript
+  it('returns 400 for a malformed date param without calling the downstream function', async () => {
+    const req = new Request('https://worker.example/stats?from=not-a-date');
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(400);
+    expect(getServiceStats).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 for a non-positive page param', async () => {
+    const req = new Request('https://worker.example/logs?page=0');
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(400);
+    expect(getLogs).not.toHaveBeenCalled();
+  });
+```
+
+(Since `getServiceStats`/`getLogs` are mocked at the top of this test file via `vi.mock`, `mockReset()` or a fresh `beforeEach` may be needed so an earlier test's mock call count doesn't leak into these `not.toHaveBeenCalled()` assertions — check the existing file's setup and add a `beforeEach(() => { vi.clearAllMocks(); })` if one isn't already there.)
+
+- [ ] **Step 10: Run the full backend suite**
+
+Run: `cd backend && npm test`
+Expected: all pass, test count higher than before Task H+I combined.
+
+- [ ] **Step 11: Add a one-line clarifying comment in `backend/src/shared/db.ts`**
+
+Above the `ssl: { rejectUnauthorized: false }` line, add:
+
+```typescript
+    // Supabase's connection pooler presents a cert Workers' default trust
+    // store doesn't validate; connection is still encrypted, just not
+    // certificate-pinned. Documented as a known trade-off, not an oversight.
+```
+
+- [ ] **Step 12: Run the full suite once more and typecheck**
+
+Run: `cd backend && npm test && npm run typecheck && npm run lint`
+Expected: all clean.
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add backend/src/upload-handler/clean.ts backend/src/upload-handler/clean.test.ts backend/src/worker/index.ts backend/src/worker/index.test.ts backend/src/shared/db.ts
+git commit -m "fix: validate status codes and query params, correct error status codes, count all data-quality flags"
+```
+
+### Note for later docs (README / interview-qa)
+
+The reviewer also found that the spec's own incident definition ("maximal contiguous run of non-2xx checks") legitimately produces 4 incidents for the one real outage in `9d_seed101` that `dataset_incident_log.json` records as a single event — because two 200-status checks land in the middle of it (at unusually high latency: ~2.2s and ~3.0s against a ~700ms baseline). This is a genuine product/definition question, not a bug like the two above (999-inclusion and duplicate-timestamp ordering, both fixed in Task H) — deciding whether a handful of slow-but-200 responses should still count as "down" needs a documented, deliberate assumption, not a silently invented heuristic. Flag this explicitly in the README's Assumptions section, referencing this exact case as the evidence, and note in "what I'd do differently" that a latency-aware or gap-tolerant incident definition is worth considering.
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).
