@@ -1,4 +1,3 @@
-import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
 import { cleanBatch } from './clean';
 import { insertCleanedRows } from '../shared/db';
 
@@ -28,21 +27,5 @@ export async function handleUpload(
       rows_skipped: result.rows_skipped,
       flags_summary: result.flags_summary,
     },
-  };
-}
-
-export async function handler(
-  event: APIGatewayProxyEventV2,
-): Promise<APIGatewayProxyStructuredResultV2> {
-  const csvText = event.isBase64Encoded && event.body
-    ? Buffer.from(event.body, 'base64').toString('utf-8')
-    : event.body ?? '';
-
-  const result = await handleUpload(csvText);
-
-  return {
-    statusCode: result.statusCode,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(result.body),
   };
 }
