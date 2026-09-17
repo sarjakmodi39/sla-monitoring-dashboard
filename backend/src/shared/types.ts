@@ -33,3 +33,4 @@ export interface CleanResult {
   rows_skipped: number;
   flags_summary: Record<DataQualityFlag, number>;
 }
+

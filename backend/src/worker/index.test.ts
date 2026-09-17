@@ -24,7 +24,10 @@ describe('worker fetch', () => {
   });
 
   it('routes GET /stats with parsed query params', async () => {
-    vi.mocked(getServiceStats).mockResolvedValue({ overall: {}, by_service: [] });
+    vi.mocked(getServiceStats).mockResolvedValue({
+      overall: { total_services: 1, services_breaching_slo: 0 },
+      by_service: [],
+    });
     const req = new Request('https://worker.example/stats?from=2025-05-01&to=2025-05-02');
     const res = await worker.fetch(req, env);
     expect(getServiceStats).toHaveBeenCalledWith('2025-05-01', '2025-05-02');
