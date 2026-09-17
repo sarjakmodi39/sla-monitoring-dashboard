@@ -1,7 +1,9 @@
 # SLA Monitoring Dashboard — Design Spec
 
-**Date:** 2026-09-16
+**Date:** 2026-09-16 (amended 2026-09-17: serverless provider changed from AWS Lambda to Cloudflare Workers — see §2/§3/§11)
 **Context:** Take-home assignment (`problem_statement.md`), Full Stack Developer role. 6–8 hour budget. Must be explainable line-by-line in a follow-up discussion — this spec exists so the author can defend every decision, not just the code.
+
+**Amendment 2026-09-17:** the author has no AWS account and doesn't want to create one. Cloudflare Workers is explicitly listed as an accepted platform in the problem statement, needs no credit card for its free tier, and the actual TypeScript business logic (parsing/cleaning/stats/logs — everything in `clean.ts`, `db.ts`, `stats.ts`, `logs.ts`, `dateRange.ts`) is unaffected; only the outermost platform-adapter layer changes.
 
 ## 1. Goals / Non-goals
 
@@ -18,30 +20,28 @@
 | Layer | Choice | Why |
 |---|---|---|
 | Frontend | React + Vite + TypeScript, hosted on **Vercel** | Single language across the stack; git-connected auto-deploy satisfies "live URL" requirement with minimal ceremony. |
-| Serverless function | **AWS Lambda** (Node.js/TypeScript) behind **API Gateway (HTTP API)** | Canonical, widely-recognized "real cloud serverless function"; generous perpetual free tier. |
-| Database | **Postgres via Supabase** | Free-tier hosted Postgres reachable over a plain connection string from Lambda (no VPC networking like RDS requires). SQL makes date-range filtering and aggregate stats trivial to write and explain. |
-| Deploy tooling (backend) | **AWS SAM** (`template.yaml`, `sam build && sam deploy`) | Official AWS tool, no third-party account, plain YAML that's easy to read line-by-line in an interview. |
+| Serverless function | **Cloudflare Worker** (TypeScript, Fetch API) | ~~AWS Lambda~~ — no credit card required for the free tier (author has no AWS account), explicitly accepted by the problem statement, and deploys as a single script with no API Gateway equivalent needed (the Worker itself receives the HTTP request). |
+| Database | **Postgres via Supabase** | Free-tier hosted Postgres reachable over a plain connection string (works the same from a Worker as it did from Lambda). SQL makes date-range filtering and aggregate stats trivial to write and explain. |
+| Deploy tooling (backend) | **Wrangler** (Cloudflare's CLI: `wrangler.toml`, `wrangler deploy`) | ~~AWS SAM~~ — Cloudflare's official tool, no AWS account, plain TOML that's easy to read line-by-line in an interview. |
 
 ## 3. Architecture
 
 ```
 Browser (React, Vercel)
-   │  POST /upload   (raw CSV bytes, multipart or text body)
+   │  POST /upload   (raw CSV text body)
+   │  GET /stats?from=&to=
+   │  GET /logs?from=&to=&service=&page=
    ▼
-API Gateway (HTTP API)  ──▶  Lambda: upload-handler
-   │                              parses → validates → cleans → bulk INSERT
+Cloudflare Worker (single script, internal router)
+   │  /upload → parses → validates → cleans → bulk INSERT
+   │  /stats, /logs → query
    ▼
 Supabase Postgres (checks table)
-   ▲
-   │  GET /stats?from=&to=        GET /logs?from=&to=&service=&page=
-API Gateway  ──▶  Lambda: query-handler
-   ▲
-Browser (dashboard fetch calls)
 ```
 
-Two Lambda functions share one API Gateway. Both are stateless — all state lives in Postgres. No server the author has to run or manage.
+One Worker script, dispatching on path/method internally (same routing shape the old query-handler router used) — no separate API Gateway resource is needed, since the Worker itself is the HTTP endpoint. Stateless — all state lives in Postgres. No server the author has to run or manage.
 
-**Why synchronous direct-POST instead of S3 presigned-upload + event trigger:** files here are ≤1.2MB, well under API Gateway's 10MB payload limit. A synchronous POST-and-wait is simpler to build, run, and explain than presigned URL + S3 event + async status polling. That async pattern is the textbook answer for large files; it's called out under "what I'd do differently" rather than built, since this dataset doesn't need it.
+**Why synchronous direct-POST instead of an object-storage presigned-upload + event trigger:** files here are ≤1.2MB, well under a Worker's request body limit (100MB on the free tier). A synchronous POST-and-wait is simpler to build, run, and explain than presigned URL + storage event + async status polling. That async pattern is the textbook answer for large files; it's called out under "what I'd do differently" rather than built, since this dataset doesn't need it.
 
 ## 4. Project structure
 
@@ -54,17 +54,20 @@ Two Lambda functions share one API Gateway. Both are stateless — all state liv
     api.ts                 fetch wrappers to API Gateway
 /backend
   /upload-handler
-    index.ts               Lambda entry point (thin: request → clean() → db insert)
+    index.ts               exports handleUpload(csvText, insert?) — pure, platform-agnostic
     clean.ts                pure functions: parse, detect+fix timestamp/unit, dedupe, flag
-    clean.test.ts           unit tests for clean.ts (Vitest) — no AWS/DB needed to run these
+    clean.test.ts           unit tests for clean.ts (Vitest) — no cloud/DB needed to run these
     db.ts                   pg client + insert helper
   /query-handler
-    index.ts               routes GET /stats and GET /logs
     stats.ts                SQL for per-service uptime/latency/incident aggregates
     logs.ts                 SQL for paginated filtered log query
+  /worker
+    index.ts               Cloudflare Worker entrypoint: fetch(request) → routes /upload, /stats, /logs to the functions above, adapts Request/Response
+    index.test.ts           tests the routing/adaptation layer
   /shared
-    types.ts                shared row/response types imported by both handlers
-  template.yaml             SAM template: 2 Lambdas + HTTP API + env vars
+    types.ts                shared row/response types
+    dateRange.ts            single-date/range → [start, end) UTC bounds
+  wrangler.toml             Cloudflare Worker config: entry point, compatibility date, DATABASE_URL binding
   schema.sql                one-time table creation, run once against Supabase
 /docs
   architecture.md
@@ -132,8 +135,8 @@ Single page. **Top:** collapsible stats panel (default expanded), one card per s
 
 ## 9. Error handling
 
-- **upload-handler:** validates the CSV header row matches expected columns before processing; returns 400 with a clear message on mismatch or empty file. Per-row problems are cleaned/flagged, not rejected, except rows missing a required field, which are skipped and counted.
-- **query-handler:** validates date params are parseable dates; 400 with message otherwise.
+- **`/upload`:** validates the CSV header row matches expected columns before processing; returns 400 with a clear message on mismatch or empty file. Per-row problems are cleaned/flagged, not rejected, except rows missing a required field, which are skipped and counted.
+- **`/stats`, `/logs`:** validate date params are parseable dates; 400 with message otherwise.
 - **Frontend:** loading state during upload/query, error banner on non-2xx response, disabled upload button while a request is in flight.
 
 ## 10. Testing
@@ -143,9 +146,10 @@ Given "no CI pipelines" is explicitly out of scope, tests are run locally, not w
 ## 11. Deployment / redeploy
 
 - **Database:** create a free Supabase project via its web UI, run `backend/schema.sql` once in the Supabase SQL editor.
-- **Backend:** `sam build && sam deploy --guided` first time (prompts for and stores the Supabase `DATABASE_URL` as a Lambda env var via SAM config, not committed to git); subsequent deploys are `sam build && sam deploy`.
-- **Frontend:** Vercel project connected to the GitHub repo, auto-deploys on push to `main`; `VITE_API_BASE_URL` env var set in Vercel dashboard to the deployed API Gateway stage URL.
-- **Secrets:** `DATABASE_URL` never committed — lives in `samconfig.toml` (gitignored) locally and as a stored SAM deploy parameter / Lambda env var in AWS. `.env.local` (gitignored) holds the same for local Lambda testing via `sam local`.
+- **Backend:** free Cloudflare account (no card required), `npm install -g wrangler`, `wrangler login`, `wrangler secret put DATABASE_URL` once (stores the Supabase connection string as an encrypted Worker secret, never committed), then `wrangler deploy`. Redeploys are just `wrangler deploy` again.
+- **Frontend:** Vercel project connected to the GitHub repo, auto-deploys on push to `main`; `VITE_API_BASE_URL` env var set in Vercel dashboard to the deployed Worker's URL (`https://<worker-name>.<account>.workers.dev`).
+- **Secrets:** `DATABASE_URL` never committed — lives as a Cloudflare Worker secret (set via `wrangler secret put`, not in `wrangler.toml`) and in a gitignored `.dev.vars` file for local testing via `wrangler dev`.
+- **Local dev (added ahead of any cloud deploy, at the author's request):** a plain Node HTTP server (`backend/scripts/local-server.ts`, run via `npm run dev`) wraps the same handler functions the Worker uses, so the full flow (frontend → local API → real Supabase Postgres) can be verified before touching Cloudflare at all. Dev-only; not part of the deployed architecture.
 
 ## 12. Deliverables checklist
 
