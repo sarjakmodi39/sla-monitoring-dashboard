@@ -3791,6 +3791,98 @@ The reviewer also found that the spec's own incident definition ("maximal contig
 
 ---
 
+## Amendment (2026-09-17, seventh): schema migration script, at the author's request
+
+The author asked whether schema setup should be "done via code" rather than manually pasted into Supabase's SQL Editor. `schema.sql` was already version-controlled, but running it was a manual copy-paste. This adds a small script so it's `npm run migrate` instead — still human-triggered (no CI, per the assignment's exclusion), but no more GUI copy-paste.
+
+### Task K: schema migration script
+
+**Files:**
+- Create: `backend/scripts/migrate.mjs`
+- Modify: `backend/package.json` (add `migrate` script)
+
+**Interfaces:** none — standalone script, not imported by any application code.
+
+- [ ] **Step 1: Write `backend/scripts/migrate.mjs`**
+
+```javascript
+import { Client } from 'pg';
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const backendRoot = join(__dirname, '..');
+
+function loadDevVars() {
+  const devVarsPath = join(backendRoot, '.dev.vars');
+  if (!existsSync(devVarsPath)) return;
+  const content = readFileSync(devVarsPath, 'utf-8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadDevVars();
+
+async function migrate() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    console.error('DATABASE_URL is not set. Create backend/.dev.vars (see .dev.vars.example) or export it, then retry.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const sql = readFileSync(join(backendRoot, 'schema.sql'), 'utf-8');
+  const client = new Client({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } });
+
+  await client.connect();
+  try {
+    await client.query(sql);
+    console.log('Schema applied successfully.');
+  } finally {
+    await client.end();
+  }
+}
+
+migrate().catch((err) => {
+  console.error('Migration failed:', err.message);
+  process.exitCode = 1;
+});
+```
+
+(This reads `DATABASE_URL` from `backend/.dev.vars` if it's not already set as a real environment variable — the same file `wrangler dev` already reads — so there's exactly one place credentials live for local use. `schema.sql`'s `create table if not exists`/`create index if not exists` make this safe to re-run.)
+
+- [ ] **Step 2: Add the `migrate` script to `backend/package.json`**
+
+```json
+    "migrate": "node scripts/migrate.mjs",
+```
+
+(add alongside `test`/`typecheck`/`dev`/`lint`)
+
+- [ ] **Step 3: Verify against a real database**
+
+This step needs a real `DATABASE_URL` in `backend/.dev.vars` — if one isn't present, note that in your report and skip running it (don't fabricate a passing result). If one is present:
+
+Run: `cd backend && npm run migrate`
+Expected: prints `Schema applied successfully.` and exits 0. Run it a second time immediately after — expected: same success message (idempotent, no error on re-run).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add backend/scripts/migrate.mjs backend/package.json
+git commit -m "feat: add schema migration script (npm run migrate)"
+```
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).
