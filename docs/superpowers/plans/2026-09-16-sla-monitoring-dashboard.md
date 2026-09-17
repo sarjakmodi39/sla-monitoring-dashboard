@@ -2958,6 +2958,98 @@ git commit -m "fix: surface stats/logs load failures in the UI instead of failin
 
 ---
 
+## Amendment (2026-09-17, fifth): switch local dev to `wrangler dev`, fix a real Workers/pg compatibility gap
+
+The author pushed back on `backend/scripts/local-server.ts` twice, asking to check standard practice instead of a custom script. Checking: since this backend deploys as a Cloudflare Worker, the actual standard local-dev tool is Wrangler's own `wrangler dev`, which runs the real Worker code locally via Cloudflare's Miniflare/workerd emulator — no custom Node HTTP-to-Fetch-API glue needed at all. Verified via Cloudflare's own docs that `wrangler dev` needs no login for a Worker with no Cloudflare-account-bound remote bindings (ours only reaches out to Supabase over plain TCP), so this doesn't even need Task 12 done first.
+
+**This investigation also surfaced a real, previously-unnoticed bug:** Cloudflare Workers can only run `pg` (node-postgres) — which relies on Node's `net`/`tls` sockets — when `compatibility_flags = ["nodejs_compat"]` is set in `wrangler.toml`; ours doesn't have it. Without this flag, `wrangler deploy` would very likely fail at runtime the first time `db.ts` tried to connect. (Confirmed: the installed `pg` version, 8.23.0, already satisfies Cloudflare's documented minimum of 8.16.3, so no dependency bump is needed — only the flag.) Good that this surfaced now, before an actual deploy attempt.
+
+### Task G: wrangler dev + nodejs_compat fix
+
+**Files:**
+- Modify: `backend/wrangler.toml` (add `compatibility_flags`)
+- Delete: `backend/scripts/local-server.ts`
+- Modify: `backend/package.json` (`dev` script, dependencies)
+- Create: `backend/.dev.vars.example`
+- Modify: repo-root `.gitignore` (ignore `.dev.vars`)
+
+**Interfaces:** none — this only changes how the Worker is run locally and fixes its deploy-time compatibility; `src/worker/index.ts`, `src/upload-handler/index.ts`, `src/query-handler/*.ts`, and all their tests are untouched.
+
+- [ ] **Step 1: Fix the compatibility gap in `backend/wrangler.toml`**
+
+```toml
+name = "sla-dashboard-backend"
+main = "src/worker/index.ts"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+```
+
+- [ ] **Step 2: Delete the custom dev server**
+
+```bash
+git rm backend/scripts/local-server.ts
+```
+
+(Its directory, `backend/scripts/`, will be empty after this — that's fine, git doesn't track empty directories, no further action needed.)
+
+- [ ] **Step 3: Add `wrangler` as a project devDependency**
+
+Add to `backend/package.json`'s `devDependencies` (alphabetical order), and remove the now-unused `tsx` line (nothing else in this project imports or runs it):
+
+```json
+    "wrangler": "^3.78.0",
+```
+
+- [ ] **Step 4: Update the `dev` script**
+
+Change `backend/package.json`'s `"dev"` script from `"tsx scripts/local-server.ts"` to:
+
+```json
+    "dev": "wrangler dev",
+```
+
+- [ ] **Step 5: Add local-dev secrets support**
+
+Create `backend/.dev.vars.example` (committed — a template, not a real secret):
+
+```
+DATABASE_URL=postgresql://user:password@host:5432/postgres
+```
+
+Add `.dev.vars` (the real, gitignored file each developer creates locally from the example above) to the repo-root `.gitignore`:
+
+```
+.dev.vars
+```
+
+- [ ] **Step 6: Install and verify**
+
+Run: `cd backend && npm install`
+Run: `npx wrangler dev` — expect it to print a local URL (typically `http://localhost:8787`) with no authentication prompt. From another terminal, `curl http://localhost:8787/nope` — expect `{"error":"Unknown route: /nope"}`. Stop `wrangler dev` (Ctrl+C) when confirmed.
+
+Note: without a `.dev.vars` file present, `/stats`/`/logs`/`/upload` will fail to reach a database (same as before) — that's expected and unrelated to this task; the goal here is confirming `wrangler dev` itself boots and routes correctly, which the 404 check above already proves.
+
+- [ ] **Step 7: Run the backend test suite**
+
+Run: `cd backend && npm test`
+Expected: same pass count as before (this task touches no application code, only tooling/config) — confirms nothing broke.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add backend/wrangler.toml backend/package.json backend/package-lock.json backend/.dev.vars.example .gitignore
+git commit -m "chore: switch local dev to wrangler dev, fix nodejs_compat gap for pg"
+```
+
+### Note for later docs (README / interview-qa, Tasks 22/24)
+
+Flag as an honest "what I'd verify further" item: Cloudflare's own tutorial for `pg` on Workers demonstrates the single-connection `Client` class, not `Pool`. `db.ts` uses a module-scope singleton `Pool` (justified originally by the Lambda-style "reuse across warm invocations" pattern, which likely still applies to Workers' warm-isolate reuse — but this isn't explicitly confirmed by Cloudflare's docs for `Pool` specifically, only for `Client`). Not changed here without stronger evidence it's actually broken — rewriting `db.ts` around `Client` would be a real, testable follow-up if `Pool` turns out to misbehave under real Workers traffic.
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).
