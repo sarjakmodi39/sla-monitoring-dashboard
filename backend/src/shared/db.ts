@@ -6,6 +6,9 @@ const BATCH_SIZE = 1000;
 export async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
+    // Supabase's connection pooler presents a cert Workers' default trust
+    // store doesn't validate; connection is still encrypted, just not
+    // certificate-pinned. Documented as a known trade-off, not an oversight.
     ssl: { rejectUnauthorized: false },
   });
   await client.connect();

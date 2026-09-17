@@ -44,6 +44,16 @@ describe('cleanRow', () => {
     const result = cleanRow({ ...base, timestamp: '1746938700', latency: '-5' }, 'raw-line');
     expect(result?.data_quality_flag).toBe('negative_latency_nulled');
   });
+
+  it('returns null when status_code is blank rather than treating it as 0', () => {
+    const result = cleanRow({ ...base, status_code: '' }, 'raw-line');
+    expect(result).toBeNull();
+  });
+
+  it('returns null when status_code has non-digit characters', () => {
+    const result = cleanRow({ ...base, status_code: '2xx' }, 'raw-line');
+    expect(result).toBeNull();
+  });
 });
 
 describe('cleanBatch', () => {
@@ -61,6 +71,6 @@ describe('cleanBatch', () => {
     expect(result.rows_skipped).toBe(1);
     expect(result.rows).toHaveLength(2);
     expect(result.flags_summary.unit_converted).toBe(1);
-    expect(result.flags_summary.epoch_timestamp).toBe(0);
+    expect(result.flags_summary.epoch_timestamp).toBe(1);
   });
 });

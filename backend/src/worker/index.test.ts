@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../upload-handler/index', () => ({ handleUpload: vi.fn() }));
 vi.mock('../query-handler/stats', () => ({ getServiceStats: vi.fn() }));
@@ -13,6 +13,10 @@ import type { Env } from './index';
 const env: Env = { DATABASE_URL: 'postgres://test' };
 
 describe('worker fetch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('routes POST /upload to handleUpload with the request body text', async () => {
     vi.mocked(handleUpload).mockResolvedValue({ statusCode: 200, body: { rows_received: 1 } });
     const req = new Request('https://worker.example/upload', { method: 'POST', body: 'a,b\n1,2' });
@@ -56,11 +60,25 @@ describe('worker fetch', () => {
     expect(res.status).toBe(404);
   });
 
-  it('returns 400 when a downstream call throws', async () => {
+  it('returns 500 when a downstream call throws', async () => {
     vi.mocked(getServiceStats).mockRejectedValue(new Error('boom'));
     const req = new Request('https://worker.example/stats');
     const res = await worker.fetch(req, env);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: 'boom' });
+  });
+
+  it('returns 400 for a malformed date param without calling the downstream function', async () => {
+    const req = new Request('https://worker.example/stats?from=not-a-date');
+    const res = await worker.fetch(req, env);
+    expect(res.status).toBe(400);
+    expect(getServiceStats).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 for a non-positive page param', async () => {
+    const req = new Request('https://worker.example/logs?page=0');
+    const res = await worker.fetch(req, env);
+    expect(res.status).toBe(400);
+    expect(getLogs).not.toHaveBeenCalled();
   });
 });

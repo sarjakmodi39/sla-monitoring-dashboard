@@ -8,8 +8,8 @@ export function cleanRow(raw: RawCheckRow, rawLine: string): CleanedCheckRow | n
   const { iso, wasEpoch } = normalizeTimestamp(raw.timestamp);
   if (iso === null) return null;
 
+  if (!/^\d+$/.test(raw.status_code.trim())) return null;
   const statusCode = Number(raw.status_code);
-  if (isNaN(statusCode)) return null;
 
   const { ms, flag: latencyFlag } = normalizeLatency(raw.latency, raw.latency_unit);
   const flag: DataQualityFlag | null = latencyFlag ?? (wasEpoch ? 'epoch_timestamp' : null);
@@ -44,8 +44,15 @@ export function cleanBatch(csvText: string): CleanResult {
       skipped++;
       continue;
     }
-    if (row.data_quality_flag) flagsSummary[row.data_quality_flag]++;
     rows.push(row);
+
+    // Count every applicable issue for accurate reporting, even though only
+    // one is stored per row on `data_quality_flag` (latency issues take
+    // storage priority — see cleanRow).
+    const { wasEpoch } = normalizeTimestamp(raw.timestamp);
+    if (wasEpoch) flagsSummary.epoch_timestamp++;
+    const { flag: latencyFlag } = normalizeLatency(raw.latency, raw.latency_unit);
+    if (latencyFlag) flagsSummary[latencyFlag]++;
   }
 
   return { rows, rows_received: parsed.length, rows_skipped: skipped, flags_summary: flagsSummary };
