@@ -23,6 +23,432 @@
 
 ---
 
+## Amendment (2026-09-17): Cloudflare Workers replaces AWS Lambda
+
+The author has no AWS account and doesn't want to create one. Cloudflare
+Workers is explicitly accepted by the problem statement, needs no credit
+card for its free tier, and only the outermost platform-adapter layer
+changes — `clean.ts`, `db.ts`, `stats.ts`, `logs.ts`, `dateRange.ts`, and
+every test already written for them are **completely unaffected** and
+need no rework. See the design spec's 2026-09-17 amendment for the
+updated architecture diagram and stack table.
+
+This supersedes parts of Tasks 6 and 9 (already implemented under the old
+Lambda shape) and replaces Tasks 10, 12, and 13 outright. Tasks 14-24 need
+no functional change — wherever they say "API Gateway URL" or "deployed
+API", read it as "the deployed Worker's URL"; the API contracts, response
+shapes, and frontend code are identical regardless of which cloud platform
+serves them.
+
+### Amendment to Task 6 (upload-handler)
+
+Remove the Lambda-shaped `handler` export and its test from
+`backend/src/upload-handler/index.ts` / `index.test.ts` — the
+`@types/aws-lambda`-typed `APIGatewayProxyEventV2` wrapper and its
+base64-decoding logic are no longer needed (a Cloudflare Worker receives a
+standard Fetch API `Request`, whose `.text()` already gives the raw body
+with no base64 concern). **Keep `handleUpload(csvText, insert?)` and its
+three existing tests completely unchanged** — the new Worker (Task
+10-replacement below) calls `handleUpload` directly.
+
+### Amendment to Task 9 (query-handler router)
+
+Delete `backend/src/query-handler/index.ts` and
+`backend/src/query-handler/index.test.ts` entirely — this Lambda-shaped
+router is fully superseded by the new Worker's routing (Task 10-replacement
+below), which does the same path-based dispatch but adapts `Request`/
+`Response` instead of API Gateway's event shape. `stats.ts` and `logs.ts`
+(and their tests) are untouched.
+
+### Task 10-replacement: Cloudflare Worker entrypoint
+
+**Files:**
+- Create: `backend/src/worker/index.ts`
+- Test: `backend/src/worker/index.test.ts`
+- Create: `backend/wrangler.toml`
+- Delete: `backend/template.yaml` (superseded)
+
+**Interfaces:**
+- Consumes: `handleUpload` from `../upload-handler/index`, `getServiceStats` from `../query-handler/stats`, `getLogs` from `../query-handler/logs`.
+- Produces: a Cloudflare Worker default export (`fetch(request, env)`) — this is what Wrangler deploys.
+
+- [ ] **Step 0: Add DOM types so `Request`/`Response`/`URL` type-check**
+
+`backend/tsconfig.json` currently has `"lib": ["ES2022"]`, which doesn't
+include the Fetch API types this Worker needs. Change that line to:
+
+```json
+    "lib": ["ES2022", "DOM"],
+```
+
+This only affects type-checking (Node and the Workers runtime both provide
+these globals already); it doesn't change any runtime behavior. Run `cd
+backend && npm run typecheck` after this one-line change — expect it to
+still pass cleanly (no other file references anything DOM-specific).
+
+- [ ] **Step 1: Write the failing tests**
+
+```typescript
+import { describe, it, expect, vi } from 'vitest';
+
+vi.mock('../upload-handler/index', () => ({ handleUpload: vi.fn() }));
+vi.mock('../query-handler/stats', () => ({ getServiceStats: vi.fn() }));
+vi.mock('../query-handler/logs', () => ({ getLogs: vi.fn() }));
+
+import worker from './index';
+import { handleUpload } from '../upload-handler/index';
+import { getServiceStats } from '../query-handler/stats';
+import { getLogs } from '../query-handler/logs';
+
+const env = { DATABASE_URL: 'postgres://test' };
+
+describe('worker fetch', () => {
+  it('routes POST /upload to handleUpload with the request body text', async () => {
+    (handleUpload as any).mockResolvedValue({ statusCode: 200, body: { rows_received: 1 } });
+    const req = new Request('https://worker.example/upload', { method: 'POST', body: 'a,b\n1,2' });
+    const res = await worker.fetch(req, env as any);
+    expect(handleUpload).toHaveBeenCalledWith('a,b\n1,2');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ rows_received: 1 });
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('routes GET /stats with parsed query params', async () => {
+    (getServiceStats as any).mockResolvedValue({ overall: {}, by_service: [] });
+    const req = new Request('https://worker.example/stats?from=2025-05-01&to=2025-05-02');
+    const res = await worker.fetch(req, env as any);
+    expect(getServiceStats).toHaveBeenCalledWith('2025-05-01', '2025-05-02');
+    expect(res.status).toBe(200);
+  });
+
+  it('routes GET /logs with parsed pagination', async () => {
+    (getLogs as any).mockResolvedValue({ rows: [], total: 0, page: 2, page_size: 25 });
+    const req = new Request('https://worker.example/logs?service=svc-auth&page=2&page_size=25');
+    const res = await worker.fetch(req, env as any);
+    expect(getLogs).toHaveBeenCalledWith({ from: undefined, to: undefined, service: 'svc-auth', page: 2, pageSize: 25 });
+    expect(res.status).toBe(200);
+  });
+
+  it('returns 404 for an unknown route', async () => {
+    const req = new Request('https://worker.example/nope');
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400 when a downstream call throws', async () => {
+    (getServiceStats as any).mockRejectedValue(new Error('boom'));
+    const req = new Request('https://worker.example/stats');
+    const res = await worker.fetch(req, env as any);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'boom' });
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cd backend && npx vitest run src/worker/index.test.ts`
+Expected: FAIL — `./index` (worker) module not found.
+
+- [ ] **Step 3: Write the implementation**
+
+```typescript
+import { handleUpload } from '../upload-handler/index';
+import { getServiceStats } from '../query-handler/stats';
+import { getLogs } from '../query-handler/logs';
+
+export interface Env {
+  DATABASE_URL: string;
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    process.env.DATABASE_URL = env.DATABASE_URL;
+    const url = new URL(request.url);
+
+    try {
+      if (request.method === 'POST' && url.pathname === '/upload') {
+        const csvText = await request.text();
+        const result = await handleUpload(csvText);
+        return json(result.statusCode, result.body);
+      }
+      if (url.pathname === '/stats') {
+        const data = await getServiceStats(
+          url.searchParams.get('from') ?? undefined,
+          url.searchParams.get('to') ?? undefined,
+        );
+        return json(200, data);
+      }
+      if (url.pathname === '/logs') {
+        const data = await getLogs({
+          from: url.searchParams.get('from') ?? undefined,
+          to: url.searchParams.get('to') ?? undefined,
+          service: url.searchParams.get('service') ?? undefined,
+          page: Number(url.searchParams.get('page') ?? '1'),
+          pageSize: Number(url.searchParams.get('page_size') ?? '50'),
+        });
+        return json(200, data);
+      }
+      return json(404, { error: `Unknown route: ${url.pathname}` });
+    } catch (err) {
+      return json(400, { error: (err as Error).message });
+    }
+  },
+};
+```
+
+Note: `backend/src/shared/db.ts`'s `getPool()` reads `process.env.DATABASE_URL` — setting it from `env.DATABASE_URL` at the top of `fetch` (Workers pass config via the `env` parameter, not real process env vars) makes that existing, already-tested code work unchanged on Workers. This is the only place any previously-written file's *behavior* depends on the new platform, and it requires no edit to `db.ts` itself.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cd backend && npx vitest run src/worker/index.test.ts`
+Expected: all PASS.
+
+- [ ] **Step 5: Write `backend/wrangler.toml`**
+
+```toml
+name = "sla-dashboard-backend"
+main = "src/worker/index.ts"
+compatibility_date = "2024-09-01"
+
+[observability]
+enabled = true
+```
+
+(`DATABASE_URL` is deliberately absent from this file — it's set via `wrangler secret put DATABASE_URL`, a manual step, so it's never committed.)
+
+- [ ] **Step 6: Delete the superseded files**
+
+```bash
+git rm backend/template.yaml
+```
+
+- [ ] **Step 7: Run the full backend suite**
+
+Run: `cd backend && npm test`
+Expected: all tests pass (the amended Task 6/9 removals plus this new worker test file).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add backend/src/worker/index.ts backend/src/worker/index.test.ts backend/wrangler.toml
+git commit -m "feat: add Cloudflare Worker entrypoint, replacing Lambda handlers"
+```
+
+### Task 12-replacement (MANUAL — requires your own free Cloudflare account): Install and configure Wrangler
+
+- [ ] **Step 1:** Sign up free at dash.cloudflare.com — no credit card required for the Workers free tier.
+- [ ] **Step 2:** `npm install -g wrangler` (or run via `npx wrangler` each time, no global install needed).
+- [ ] **Step 3:** `wrangler login` — opens a browser to authenticate.
+- [ ] **Step 4:** Verify: `wrangler whoami` should show your account.
+
+### Task 13-replacement (MANUAL — first deploy needs your login): Deploy the backend
+
+- [ ] **Step 1:** From `backend/`, set the database secret (paste your Supabase connection string from Task 11 when prompted):
+
+```bash
+wrangler secret put DATABASE_URL
+```
+
+- [ ] **Step 2:** Deploy:
+
+```bash
+wrangler deploy
+```
+
+Expected output includes a URL like `https://sla-dashboard-backend.<your-subdomain>.workers.dev` — save it, every later task that said "API Gateway URL" means this.
+
+- [ ] **Step 3:** Smoke-test:
+
+```bash
+curl -X POST "<worker-url>/upload" -H "Content-Type: text/csv" --data-binary @../monitoring_checks_9d_seed101.csv
+```
+
+Expected: a JSON response with `rows_received`, `rows_inserted`, etc.
+
+### Amendment to Task 24 (interview Q&A)
+
+Question 9 becomes: "Why was a synchronous POST-to-Worker chosen over an object-storage presigned-upload + event trigger, given the files are CSVs that could in principle be large?" — everything else about that answer (file size vs. limit, simplicity trade-off) still applies, just naming Cloudflare's request-body limit instead of API Gateway's.
+
+Add a new question 16: "Why Cloudflare Workers over AWS Lambda for this project?" — answer should cite: no credit card needed for the free tier (a real constraint, not just a preference), the assignment explicitly accepting it, single-script deployment with no separate API-Gateway-equivalent resource to configure, and that the swap only touched `backend/src/worker/index.ts` + `wrangler.toml` — every pure business-logic file and its tests were unaffected, which is itself worth being able to explain (it demonstrates the platform-adapter boundary was designed correctly the first time).
+
+## Amendment (2026-09-17, second): ESLint + Lefthook, at the author's request
+
+The author asked for linting and a git-hooks tool, explicitly citing that this is local tooling, not a CI pipeline (the assignment excludes hosted CI, not local pre-commit checks). Two new tasks, inserted after the Cloudflare Worker amendment above and before Task 11 in execution order (so linting exists before the remaining backend/frontend work continues, and covers everything already written on the next commit).
+
+### Task A: ESLint for the backend
+
+**Files:**
+- Create: `backend/eslint.config.js` (flat config, ESLint 9+)
+- Modify: `backend/package.json` (add `lint` script + devDependencies)
+
+**Interfaces:** none — tooling only, no code changes to existing files besides what autofix touches.
+
+- [ ] **Step 1: Add devDependencies**
+
+```json
+    "@eslint/js": "^9.9.0",
+    "eslint": "^9.9.0",
+    "typescript-eslint": "^8.3.0"
+```
+
+(merge into `backend/package.json`'s existing `devDependencies`, keep alphabetical)
+
+- [ ] **Step 2: Add `lint` script**
+
+```json
+    "lint": "eslint src"
+```
+
+(add to `backend/package.json`'s existing `scripts`, alongside `test`/`typecheck`/`dev`)
+
+- [ ] **Step 3: Write `backend/eslint.config.js`**
+
+```javascript
+const js = require('@eslint/js');
+const tseslint = require('typescript-eslint');
+
+module.exports = tseslint.config(
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  {
+    ignores: ['dist/**', 'node_modules/**'],
+  },
+);
+```
+
+- [ ] **Step 4: Install and run**
+
+Run: `cd backend && npm install && npm run lint`
+Expected: may report real findings on existing code (e.g. unused vars) — fix any it finds by editing the flagged lines directly (don't disable rules to silence them unless a finding is a false positive you can justify in the report). Re-run until clean.
+
+- [ ] **Step 5: Run the full test suite to confirm lint fixes didn't break anything**
+
+Run: `cd backend && npm test`
+Expected: same pass count as before this task.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/package.json backend/package-lock.json backend/eslint.config.js
+git commit -m "chore: add ESLint to backend"
+```
+
+### Task B: ESLint for the frontend
+
+Same shape as Task A, applied to `frontend/`, with the React plugin added:
+
+**Files:**
+- Create: `frontend/eslint.config.js`
+- Modify: `frontend/package.json`
+
+- [ ] **Step 1: Add devDependencies**
+
+```json
+    "@eslint/js": "^9.9.0",
+    "eslint": "^9.9.0",
+    "eslint-plugin-react-hooks": "^4.6.2",
+    "typescript-eslint": "^8.3.0"
+```
+
+- [ ] **Step 2: Add `lint` script** (`"lint": "eslint src"`) to `frontend/package.json`'s `scripts`.
+
+- [ ] **Step 3: Write `frontend/eslint.config.js`**
+
+```javascript
+const js = require('@eslint/js');
+const tseslint = require('typescript-eslint');
+const reactHooks = require('eslint-plugin-react-hooks');
+
+module.exports = tseslint.config(
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  {
+    plugins: { 'react-hooks': reactHooks },
+    rules: reactHooks.configs.recommended.rules,
+  },
+  {
+    ignores: ['dist/**', 'node_modules/**'],
+  },
+);
+```
+
+- [ ] **Step 4: Install and run**
+
+Run: `cd frontend && npm install && npm run lint`
+Expected: fix any real findings directly, re-run until clean.
+
+- [ ] **Step 5: Run the full test suite and typecheck to confirm nothing broke**
+
+Run: `cd frontend && npm test && npm run typecheck`
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add frontend/package.json frontend/package-lock.json frontend/eslint.config.js
+git commit -m "chore: add ESLint to frontend"
+```
+
+### Task C: Lefthook pre-commit hook
+
+**Files:**
+- Create: `lefthook.yml` (repo root)
+- Modify: repo-root `.gitignore` (add a Lefthook-managed ignore if needed — Lefthook itself needs no ignore entry, it has no generated dir)
+
+**Interfaces:** none — this only wires existing `npm run lint`/`npm test`/`npm run typecheck` scripts (already present in both `backend/` and `frontend/` after Tasks A/B) into a git hook. No application code changes.
+
+- [ ] **Step 1: Write `lefthook.yml`** (repo root)
+
+```yaml
+pre-commit:
+  parallel: true
+  commands:
+    backend-lint:
+      root: "backend/"
+      glob: "*.ts"
+      run: npm run lint
+    backend-typecheck:
+      root: "backend/"
+      glob: "*.ts"
+      run: npm run typecheck
+    frontend-lint:
+      root: "frontend/"
+      glob: "*.{ts,tsx}"
+      run: npm run lint
+    frontend-typecheck:
+      root: "frontend/"
+      glob: "*.{ts,tsx}"
+      run: npm run typecheck
+```
+
+- [ ] **Step 2: Install Lefthook and activate the hook**
+
+Run: `npm install -g @evilmartians/lefthook` (or, if a global install isn't wanted, `npx lefthook install` works too — try `npx lefthook install` first since it needs no global install)
+Run: `npx lefthook install`
+Expected: installs a `.git/hooks/pre-commit` that Lefthook manages.
+
+- [ ] **Step 3: Verify it runs**
+
+Make a trivial whitespace-only change to any already-committed backend `.ts` file, `git add` it, and run `git commit` for real (a real commit is fine here — it's exercising the hook, and the ledger's own commit-per-task discipline expects a commit at the end of this task anyway). Confirm the hook's lint/typecheck commands actually execute and print output before the commit completes. If it fails on a real (non-trivial) finding, fix that finding — don't bypass the hook with `--no-verify`.
+
+- [ ] **Step 4: Commit `lefthook.yml` itself**
+
+```bash
+git add lefthook.yml
+git commit -m "chore: add Lefthook pre-commit hook running lint + typecheck"
+```
+
+(If Step 3's trivial-change commit already included `lefthook.yml`, skip this — don't create an empty commit.)
+
+---
+
 ## Backend
 
 ### Task 1: Backend project scaffold
