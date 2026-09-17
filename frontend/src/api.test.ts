@@ -1,13 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, MockedFunction } from 'vitest';
 import { uploadCsv, fetchStats, fetchLogs } from './api';
 
+let fetchMock: MockedFunction<typeof fetch>;
+
 beforeEach(() => {
-  vi.stubGlobal('fetch', vi.fn());
+  fetchMock = vi.fn() as MockedFunction<typeof fetch>;
+  vi.stubGlobal('fetch', fetchMock);
 });
 
 describe('api client', () => {
   it('uploadCsv posts the file text as text/csv and returns the parsed JSON', async () => {
-    (fetch as any).mockResolvedValue({ ok: true, json: async () => ({ rows_received: 1 }) });
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ rows_received: 1 }) } as Response);
     const file = new File(['a,b\n1,2'], 'test.csv', { type: 'text/csv' });
 
     const result = await uploadCsv(file);
@@ -20,15 +23,15 @@ describe('api client', () => {
   });
 
   it('fetchStats builds query params only for provided dates', async () => {
-    (fetch as any).mockResolvedValue({ ok: true, json: async () => ({ overall: {}, by_service: [] }) });
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ overall: {}, by_service: [] }) } as Response);
     await fetchStats('2025-05-01', '2025-05-02');
-    const calledUrl = (fetch as any).mock.calls[0][0] as string;
+    const calledUrl = fetchMock.mock.calls[0][0] as string;
     expect(calledUrl).toContain('from=2025-05-01');
     expect(calledUrl).toContain('to=2025-05-02');
   });
 
   it('fetchLogs throws on a non-ok response', async () => {
-    (fetch as any).mockResolvedValue({ ok: false, json: async () => ({ error: 'bad request' }) });
+    fetchMock.mockResolvedValue({ ok: false, json: async () => ({ error: 'bad request' }) } as Response);
     await expect(fetchLogs({ page: 1, pageSize: 10 })).rejects.toThrow('bad request');
   });
 });
