@@ -7,7 +7,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "migrate": "node scripts/migrate.mjs"
   },
   "dependencies": {
     "pg": "^8.11.5"
