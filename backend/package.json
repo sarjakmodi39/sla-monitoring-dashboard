@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx scripts/local-server.ts"
   },
   "dependencies": {
     "pg": "^8.11.5"
@@ -15,6 +16,7 @@
     "@types/node": "^20.14.9",
     "@types/pg": "^8.11.6",
     "esbuild": "^0.21.5",
+    "tsx": "^4.15.0",
     "typescript": "^5.5.3",
     "vitest": "^1.6.0"
   }
