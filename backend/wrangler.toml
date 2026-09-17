@@ -1,0 +1,6 @@
+name = "sla-dashboard-backend"
+main = "src/worker/index.ts"
+compatibility_date = "2024-09-01"
+
+[observability]
+enabled = true
