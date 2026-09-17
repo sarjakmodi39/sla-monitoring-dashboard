@@ -1,6 +1,7 @@
 import { handleUpload } from '../upload-handler/index';
 import { getServiceStats } from '../query-handler/stats';
 import { getLogs } from '../query-handler/logs';
+import { getErrorMessage } from '../shared/errors';
 
 export interface Env {
   DATABASE_URL: string;
@@ -43,7 +44,7 @@ export default {
       }
       return json(404, { error: `Unknown route: ${url.pathname}` });
     } catch (err) {
-      return json(400, { error: (err as Error).message });
+      return json(400, { error: getErrorMessage(err) });
     }
   },
 };
