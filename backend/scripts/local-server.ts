@@ -1,13 +1,10 @@
 import http from 'node:http';
-import { handler as uploadHandler } from '../src/upload-handler';
-import { handler as queryHandler } from '../src/query-handler';
-import type { APIGatewayProxyEventV2 } from 'aws-lambda';
+import worker from '../src/worker/index';
 
 const PORT = Number(process.env.PORT ?? 3001);
+const env = { DATABASE_URL: process.env.DATABASE_URL ?? '' };
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -19,23 +16,28 @@ const server = http.createServer(async (req, res) => {
 
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  const body = Buffer.concat(chunks).toString('utf-8');
+  const body = Buffer.concat(chunks);
 
-  const event = {
-    rawPath: url.pathname,
-    queryStringParameters: Object.fromEntries(url.searchParams),
-    body,
-    isBase64Encoded: false,
-  } as unknown as APIGatewayProxyEventV2;
+  // Forbidden/connection-management headers can't be set on a fetch Request;
+  // the worker only reads Content-Type, so forward just that (if present).
+  const forwardedHeaders: HeadersInit = {};
+  const contentType = req.headers['content-type'];
+  if (contentType) forwardedHeaders['Content-Type'] = contentType;
+
+  const request = new Request(new URL(req.url ?? '/', `http://localhost:${PORT}`), {
+    method: req.method,
+    headers: forwardedHeaders,
+    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
+  });
 
   try {
-    const result =
-      req.method === 'POST' && url.pathname === '/upload'
-        ? await uploadHandler(event)
-        : await queryHandler(event);
-
-    res.writeHead(result.statusCode ?? 200, { 'Content-Type': 'application/json' });
-    res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+    const response = await worker.fetch(request, env);
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    res.writeHead(response.status, headers);
+    res.end(Buffer.from(await response.arrayBuffer()));
   } catch (err) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: (err as Error).message }));

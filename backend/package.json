@@ -12,7 +12,6 @@
     "pg": "^8.11.5"
   },
   "devDependencies": {
-    "@types/aws-lambda": "^8.10.145",
     "@types/node": "^20.14.9",
     "@types/pg": "^8.11.6",
     "esbuild": "^0.21.5",
