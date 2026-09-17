@@ -2460,6 +2460,405 @@ git commit -m "feat: wire upload, stats, and logs into the single-screen dashboa
 
 ---
 
+## Amendment (2026-09-17, third): bugs found via Playwright + UI polish, at the author's request
+
+### Task D: fix stray build output and empty error messages
+
+Two real bugs surfaced while verifying Task 19 with Playwright against the local dev server.
+
+**Files:**
+- Create: `backend/src/shared/errors.ts`
+- Test: `backend/src/shared/errors.test.ts`
+- Modify: `backend/src/worker/index.ts` (use the new helper in its catch block)
+- Modify: `frontend/package.json` (`build` script)
+
+**Interfaces:**
+- Produces: `getErrorMessage(err: unknown): string` — consumed by `worker/index.ts`'s catch block only, for now.
+
+- [ ] **Step 1: Write the failing tests**
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { getErrorMessage } from './errors';
+
+describe('getErrorMessage', () => {
+  it('returns a normal Error message', () => {
+    expect(getErrorMessage(new Error('boom'))).toBe('boom');
+  });
+
+  it('falls back to the first sub-error message when the top-level message is empty (AggregateError)', () => {
+    const err = new AggregateError([new Error('connection refused')], '');
+    expect(getErrorMessage(err)).toBe('connection refused');
+  });
+
+  it('returns a generic fallback for a non-Error value with nothing useful', () => {
+    expect(getErrorMessage('just a string')).toBe('An unexpected error occurred');
+  });
+
+  it('returns a generic fallback for an empty AggregateError with no sub-errors', () => {
+    const err = new AggregateError([], '');
+    expect(getErrorMessage(err)).toBe('An unexpected error occurred');
+  });
+});
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cd backend && npx vitest run src/shared/errors.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `backend/src/shared/errors.ts`**
+
+```typescript
+export function getErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  if (err && typeof err === 'object' && 'errors' in err) {
+    const subErrors = (err as { errors: unknown[] }).errors;
+    if (Array.isArray(subErrors) && subErrors.length > 0) {
+      const first = subErrors[0];
+      if (first instanceof Error && first.message) return first.message;
+    }
+  }
+  return 'An unexpected error occurred';
+}
+```
+
+Why this matters concretely: a real Postgres connection failure (e.g. no `DATABASE_URL` configured, or the database unreachable) surfaces from Node's networking layer as an `AggregateError` — a container for multiple underlying connection attempts (IPv4/IPv6) — whose own top-level `.message` is empty; the useful text lives in `.errors[i].message`. Without this helper, the API returns `{"error": ""}` and the frontend renders "Upload failed: " with nothing after the colon.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `cd backend && npx vitest run src/shared/errors.test.ts`
+Expected: all PASS.
+
+- [ ] **Step 5: Wire it into the worker's catch block**
+
+In `backend/src/worker/index.ts`, add `import { getErrorMessage } from '../shared/errors';` and change the final catch block from:
+
+```typescript
+} catch (err) {
+  return json(400, { error: (err as Error).message });
+}
+```
+
+to:
+
+```typescript
+} catch (err) {
+  return json(400, { error: getErrorMessage(err) });
+}
+```
+
+- [ ] **Step 6: Run the full backend suite**
+
+Run: `cd backend && npm test`
+Expected: all pass, including the existing worker test "returns 400 when a downstream call throws" (which throws a plain `new Error('boom')` — `getErrorMessage` returns `'boom'` for that case exactly as the existing assertion expects, so this test needs no change).
+
+- [ ] **Step 7: Fix the stray `.js` build output**
+
+`frontend/package.json`'s `build` script is currently `"tsc -b && vite build"`. There is no TypeScript project-references setup here (`frontend/tsconfig.json` has no `references`/`composite`), so `-b` (project build mode) isn't doing anything useful — it emits `.js` files next to `.ts` sources in `frontend/src` because no `outDir` is set, which is what caused the stray files Task 19 had to clean up. Change the script to:
+
+```json
+    "build": "tsc --noEmit && vite build",
+```
+
+This runs a plain type-check (emits nothing, matching the existing `typecheck` script's behavior) before Vite does the actual bundling.
+
+- [ ] **Step 8: Verify the build no longer leaves stray files**
+
+Run: `cd frontend && npm run build`
+Expected: succeeds, produces `frontend/dist/`, and `git status` shows no new/modified `.ts`-adjacent `.js` files or `tsconfig.tsbuildinfo` under `frontend/src`.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add backend/src/shared/errors.ts backend/src/shared/errors.test.ts backend/src/worker/index.ts frontend/package.json
+git commit -m "fix: surface real error messages on DB failure, stop emitting stray build output"
+```
+
+### Task E: UI polish, at the author's request ("make it look nicer")
+
+**Files:**
+- Modify: `frontend/src/App.css` (full rewrite)
+- Modify: `frontend/index.html` (one added `<link>` for a webfont)
+
+**Interfaces:** none — pure styling, no component `.tsx` files change. Every class name below already exists in the components built in Tasks 16-19 (`upload-panel`, `stats-panel`, `stats-grid`, `stats-card`, `breach`, `banner`, `logs-table`, `logs-filters`, `pagination`) — this task only restyles them.
+
+- [ ] **Step 1: Add a webfont link to `frontend/index.html`**
+
+Add this line inside `<head>`, after the existing `<title>` tag:
+
+```html
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+```
+
+- [ ] **Step 2: Replace `frontend/src/App.css`**
+
+```css
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --border: #e2e4e9;
+  --text: #1a1d23;
+  --text-muted: #6b7280;
+  --primary: #4f46e5;
+  --danger: #dc2626;
+  --danger-bg: #fef2f2;
+  --danger-border: #fca5a5;
+  --success-bg: #ecfdf5;
+  --success-border: #6ee7b7;
+  --radius: 10px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+
+.app h1 {
+  font-size: 26px;
+  font-weight: 700;
+  margin: 0 0 24px;
+  letter-spacing: -0.02em;
+}
+
+.upload-panel {
+  margin-bottom: 20px;
+  padding: 20px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.upload-panel label {
+  display: block;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.upload-panel input[type="file"] {
+  font-size: 14px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: #fafafb;
+  width: 100%;
+  cursor: pointer;
+}
+
+.upload-panel input[type="file"]:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.upload-panel p {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.upload-panel p[role="alert"] {
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.banner {
+  padding: 10px 16px;
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  border-radius: 8px;
+  font-size: 14px;
+  margin-bottom: 20px;
+}
+
+.stats-panel {
+  margin-bottom: 24px;
+}
+
+.stats-panel > button {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--primary);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+
+.stats-panel > button:hover {
+  background: #f5f5ff;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.stats-card {
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--primary);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.stats-card h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.stats-card p {
+  margin: 4px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.stats-card.breach {
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.stats-card.breach h3 {
+  color: var(--danger);
+}
+
+.logs-table {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 20px;
+}
+
+.logs-filters {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.logs-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.logs-filters input,
+.logs-filters select {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.logs-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.logs-table thead th {
+  text-align: left;
+  padding: 8px 10px;
+  background: #f9fafb;
+  border-bottom: 2px solid var(--border);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+
+.logs-table tbody tr:nth-child(even) {
+  background: #fafbfc;
+}
+
+.logs-table tbody tr:hover {
+  background: #f0f1ff;
+}
+
+.logs-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pagination {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+.pagination button {
+  font-family: inherit;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.pagination button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pagination button:not(:disabled):hover {
+  background: #f5f5ff;
+  border-color: var(--primary);
+}
+```
+
+- [ ] **Step 3: Verify visually**
+
+Start the local backend (`cd backend && PORT=<port> npm run dev`) and frontend (`cd frontend && npm run dev`) with `frontend/.env.local` pointing at that port, open the page (via Playwright if available, otherwise describe what you'd check), and confirm: the upload panel, stats cards, and logs table all render with visible spacing/shadows/colors (not the old plain unstyled look), the breach-flagged stats card is visually distinct (red left border), and nothing overflows horizontally at a normal desktop width. Stop both servers when done.
+
+- [ ] **Step 4: Typecheck and build**
+
+Run: `cd frontend && npm run typecheck && npm run build`
+Expected: no errors.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add frontend/src/App.css frontend/index.html
+git commit -m "style: polish dashboard visual design"
+```
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).
