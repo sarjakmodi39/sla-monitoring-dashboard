@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const queryMock = vi.fn();
 vi.mock('../shared/db', () => ({
-  getPool: () => ({ query: queryMock }),
+  withClient: (fn: (client: { query: typeof queryMock }) => unknown) => fn({ query: queryMock }),
 }));
 
 beforeEach(() => {

@@ -1,4 +1,4 @@
-import { getPool } from '../shared/db';
+import { withClient } from '../shared/db';
 import { toRangeBounds } from '../shared/dateRange';
 
 export interface LogRow {
@@ -41,14 +41,15 @@ export async function getLogs(params: {
     limit $${dataValues.length - 1} offset $${dataValues.length}
   `;
 
-  const pool = getPool();
-  const dataResult = await pool.query(dataSql, dataValues);
-  const countResult = await pool.query(`select count(*) from checks ${where}`, values);
+  return withClient(async (client) => {
+    const dataResult = await client.query(dataSql, dataValues);
+    const countResult = await client.query(`select count(*) from checks ${where}`, values);
 
-  return {
-    rows: dataResult.rows,
-    total: Number(countResult.rows[0].count),
-    page: params.page,
-    page_size: params.pageSize,
-  };
+    return {
+      rows: dataResult.rows,
+      total: Number(countResult.rows[0].count),
+      page: params.page,
+      page_size: params.pageSize,
+    };
+  });
 }

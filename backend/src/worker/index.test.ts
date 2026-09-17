@@ -32,6 +32,14 @@ describe('worker fetch', () => {
     const res = await worker.fetch(req, env);
     expect(getServiceStats).toHaveBeenCalledWith('2025-05-01', '2025-05-02');
     expect(res.status).toBe(200);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+
+  it('responds to OPTIONS preflight with CORS headers and no body', async () => {
+    const req = new Request('https://worker.example/upload', { method: 'OPTIONS' });
+    const res = await worker.fetch(req, env);
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
   });
 
   it('routes GET /logs with parsed pagination', async () => {
