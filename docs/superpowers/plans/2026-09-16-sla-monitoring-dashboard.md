@@ -2980,12 +2980,14 @@ The author pushed back on `backend/scripts/local-server.ts` twice, asking to che
 ```toml
 name = "sla-dashboard-backend"
 main = "src/worker/index.ts"
-compatibility_date = "2024-09-01"
+compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true
 ```
+
+(`compatibility_date` also had to move from `2024-09-01` to `2024-09-23` — not just add the flag — because Cloudflare only polyfills *unprefixed* Node builtin `require()` calls, which `pg`'s own dependency tree uses throughout, on or after that specific date. An earlier draft of this task under-specified this; verify by actually running `wrangler dev` and confirming no esbuild "Could not resolve" errors for `events`/`net`/`tls`/etc., not just by copying the snippet.)
 
 - [ ] **Step 2: Delete the custom dev server**
 
