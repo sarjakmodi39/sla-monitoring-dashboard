@@ -8,3 +8,4 @@ frontend/.vercel
 frontend/dist
 .dev.vars
 backend/.wrangler/
+.playwright-mcp/
