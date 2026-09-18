@@ -9,3 +9,4 @@ frontend/dist
 .dev.vars
 backend/.wrangler/
 .playwright-mcp/
+.claude/
