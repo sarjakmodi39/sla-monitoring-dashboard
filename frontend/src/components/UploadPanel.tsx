@@ -20,19 +20,24 @@ export default function UploadPanel({ onUploaded }: { onUploaded: (summary: Uplo
 
   return (
     <section className="upload-panel">
-      <label htmlFor="csv-upload">Upload health-check CSV</label>
-      <input
-        id="csv-upload"
-        type="file"
-        accept=".csv,text/csv"
-        disabled={status === 'uploading'}
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) void handleFile(file);
-        }}
-      />
-      {status === 'uploading' && <p>Uploading and processing...</p>}
-      {status === 'error' && <p role="alert">Upload failed: {error}</p>}
+      <label htmlFor="csv-upload" className={`dropzone${status === 'uploading' ? ' dropzone-busy' : ''}`}>
+        <span className="dropzone-icon" aria-hidden="true">↑</span>
+        <span className="dropzone-text">
+          <strong>{status === 'uploading' ? 'Uploading…' : 'Upload health-check CSV'}</strong>
+          <span className="dropzone-hint">Click to choose a file, or drag it here</span>
+        </span>
+        <input
+          id="csv-upload"
+          type="file"
+          accept=".csv,text/csv"
+          disabled={status === 'uploading'}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) void handleFile(file);
+          }}
+        />
+      </label>
+      {status === 'error' && <p className="section-error" role="alert">Upload failed: {error}</p>}
     </section>
   );
 }

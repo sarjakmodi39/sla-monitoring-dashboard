@@ -47,9 +47,14 @@ export default function App() {
   useEffect(() => { void loadStats(); }, [loadStats]);
   useEffect(() => { void loadLogs(); }, [loadLogs]);
 
+  const services = (stats?.by_service ?? []).map((s) => ({ id: s.service_id, name: s.service_name }));
+
   return (
     <main className="app">
-      <h1>SLA Monitoring Dashboard</h1>
+      <header className="app-header">
+        <h1>SLA Monitoring Dashboard</h1>
+        <p className="app-subtitle">Upload health-check data and review service uptime, incidents, and raw logs.</p>
+      </header>
       <UploadPanel
         onUploaded={(summary) => {
           setBanner(
@@ -69,6 +74,7 @@ export default function App() {
         from={from}
         to={to}
         service={service}
+        services={services}
         onFromChange={(v) => { setFrom(v); setPage(1); }}
         onToChange={(v) => { setTo(v); setPage(1); }}
         onServiceChange={(v) => { setService(v); setPage(1); }}

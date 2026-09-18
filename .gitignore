@@ -10,3 +10,5 @@ frontend/dist
 backend/.wrangler/
 .playwright-mcp/
 .claude/
+.vercel
+.env*
