@@ -1,9 +1,11 @@
 # SLA Monitoring Dashboard — Design Spec
 
-**Date:** 2026-09-16 (amended 2026-09-17: serverless provider changed from AWS Lambda to Cloudflare Workers — see §2/§3/§11)
+**Date:** 2026-09-16 (amended 2026-09-17: serverless provider changed from AWS Lambda to Cloudflare Workers — see §2/§3/§11; amended 2026-09-18: DB connection routed through Cloudflare Hyperdrive — see §2/§3/§11)
 **Context:** Take-home assignment (`problem_statement.md`), Full Stack Developer role. 6–8 hour budget. Must be explainable line-by-line in a follow-up discussion — this spec exists so the author can defend every decision, not just the code.
 
 **Amendment 2026-09-17:** the author has no AWS account and doesn't want to create one. Cloudflare Workers is explicitly listed as an accepted platform in the problem statement, needs no credit card for its free tier, and the actual TypeScript business logic (parsing/cleaning/stats/logs — everything in `clean.ts`, `db.ts`, `stats.ts`, `logs.ts`, `dateRange.ts`) is unaffected; only the outermost platform-adapter layer changes.
+
+**Amendment 2026-09-18:** after the first real deploy, `/stats` and `/logs` failed against the live Supabase database with `"Connection terminated unexpectedly"`. Root-caused with a temporary raw-socket diagnostic (bypassing `pg` entirely): TCP connect and the Postgres-level `SSLRequest` negotiation both succeeded, but the Workers runtime's own `startTls()` threw `"TLS Handshake Failed."` before any application code ran — a known, currently-unresolved Cloudflare Workers platform limitation with the TCP Socket API's TLS handling against some Postgres TLS presentations (Supabase's pooler included; tracked upstream as [cloudflare/workers-sdk#3366](https://github.com/cloudflare/workers-sdk/issues/3366)). Switching `ssl:{rejectUnauthorized:false}` → `ssl:true` and re-pushing the `DATABASE_URL` secret both changed nothing — this was below the `pg`/app-config layer. Fix: **Cloudflare Hyperdrive**, a managed DB-connection proxy built for exactly this (free tier, no credit card, 100k queries/day) — the Worker now connects to Hyperdrive, which handles the real TLS hop to Postgres itself.
 
 ## 1. Goals / Non-goals
 
@@ -21,7 +23,7 @@
 |---|---|---|
 | Frontend | React + Vite + TypeScript, hosted on **Vercel** | Single language across the stack; git-connected auto-deploy satisfies "live URL" requirement with minimal ceremony. |
 | Serverless function | **Cloudflare Worker** (TypeScript, Fetch API) | ~~AWS Lambda~~ — no credit card required for the free tier (author has no AWS account), explicitly accepted by the problem statement, and deploys as a single script with no API Gateway equivalent needed (the Worker itself receives the HTTP request). |
-| Database | **Postgres via Supabase** | Free-tier hosted Postgres reachable over a plain connection string (works the same from a Worker as it did from Lambda). SQL makes date-range filtering and aggregate stats trivial to write and explain. |
+| Database | **Postgres via Supabase**, connected via **Cloudflare Hyperdrive** | Free-tier hosted Postgres; SQL makes date-range filtering and aggregate stats trivial to write and explain. Hyperdrive (not a raw Worker→Postgres TCP/TLS connection) because Workers' TCP Socket API cannot complete a TLS handshake against Supabase's pooler — see the 2026-09-18 amendment above. |
 | Deploy tooling (backend) | **Wrangler** (Cloudflare's CLI: `wrangler.toml`, `wrangler deploy`) | ~~AWS SAM~~ — Cloudflare's official tool, no AWS account, plain TOML that's easy to read line-by-line in an interview. |
 
 ## 3. Architecture
@@ -35,6 +37,9 @@ Browser (React, Vercel)
 Cloudflare Worker (single script, internal router)
    │  /upload → parses → validates → cleans → bulk INSERT
    │  /stats, /logs → query
+   ▼
+Cloudflare Hyperdrive (connection proxy — Worker's TCP Socket API
+   │                     can't TLS-handshake Supabase's pooler directly)
    ▼
 Supabase Postgres (checks table)
 ```
@@ -146,9 +151,9 @@ Given "no CI pipelines" is explicitly out of scope, tests are run locally, not w
 ## 11. Deployment / redeploy
 
 - **Database:** create a free Supabase project via its web UI, run `backend/schema.sql` once in the Supabase SQL editor.
-- **Backend:** free Cloudflare account (no card required), `npm install -g wrangler`, `wrangler login`, `wrangler secret put DATABASE_URL` once (stores the Supabase connection string as an encrypted Worker secret, never committed), then `wrangler deploy`. Redeploys are just `wrangler deploy` again.
+- **Backend:** free Cloudflare account (no card required), `npm install -g wrangler`, `wrangler login`, `wrangler hyperdrive create sla-dashboard-db --connection-string="<supabase-pooler-url>"` once (creates the managed DB-connection proxy; its `id` goes in `wrangler.toml`'s `[[hyperdrive]]` block, already committed since it's not a secret), then `wrangler deploy`. Redeploys are just `wrangler deploy` again.
 - **Frontend:** Vercel project connected to the GitHub repo, auto-deploys on push to `main`; `VITE_API_BASE_URL` env var set in Vercel dashboard to the deployed Worker's URL (`https://<worker-name>.<account>.workers.dev`).
-- **Secrets:** `DATABASE_URL` never committed — lives as a Cloudflare Worker secret (set via `wrangler secret put`, not in `wrangler.toml`) and in a gitignored `.dev.vars` file for local testing via `wrangler dev`.
+- **Secrets:** the real Supabase connection string lives only inside the Hyperdrive config (created via `wrangler hyperdrive create`, stored by Cloudflare, never committed) and in a gitignored `.dev.vars` file for local testing via `wrangler dev`/`npm run migrate`. The Worker itself holds no `DATABASE_URL` secret — it reads `env.HYPERDRIVE.connectionString` at request time.
 - **Local dev:** `wrangler dev` (run via `npm run dev` in `backend/`) runs the actual Worker code locally through Cloudflare's own emulator — no custom server needed, and no Cloudflare login required since the Worker has no account-bound remote bindings. Local secrets (`DATABASE_URL`) come from a gitignored `backend/.dev.vars` file (template at `.dev.vars.example`), read automatically by `wrangler dev`. This lets the full flow (frontend → local Worker → real Supabase Postgres) be verified before ever running `wrangler deploy`.
 - **Workers/Postgres compatibility:** `wrangler.toml` sets `compatibility_flags = ["nodejs_compat"]` — required for `pg` (which relies on Node's `net`/`tls`) to run at all under the Workers runtime; without it, `pg`'s imports fail to resolve. The installed `pg` version (8.23.0) already satisfies Cloudflare's documented minimum (8.16.3) for their Workers-compatible socket shim.
 

@@ -5,3 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "ae20e27df98e4f7ea40c9ff58569cc8c"

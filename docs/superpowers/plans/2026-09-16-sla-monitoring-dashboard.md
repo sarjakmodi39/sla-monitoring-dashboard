@@ -3883,6 +3883,73 @@ git commit -m "feat: add schema migration script (npm run migrate)"
 
 ---
 
+## Amendment (2026-09-18): Cloudflare Hyperdrive replaces raw TCP+TLS pg connection
+
+After the first real `wrangler deploy` (Task 13, done by the author), `/stats` and `/logs` returned `{"error":"Connection terminated unexpectedly"}` against the live Supabase database — despite `wrangler secret list` confirming `DATABASE_URL` was set correctly and 42/42 local tests (which mock `pg`) passing.
+
+Root-caused with a temporary diagnostic route (`/debug-tcp`, added to `worker/index.ts`, removed once done) that spoke the Postgres wire protocol directly via `cloudflare:sockets`, bypassing `pg` entirely:
+1. Raw TCP connect to `aws-0-ap-northeast-1.pooler.supabase.com:5432` — succeeded.
+2. Postgres `SSLRequest` negotiation (write 8-byte request, read 1 byte) — server replied `S` (83), meaning "SSL supported, proceed."
+3. The Workers runtime's own `socket.startTls()` — threw `"TLS Handshake Failed."`, before any `pg` code ran at all.
+
+Two narrower hypotheses were tested and ruled out first (identical failure, same stack trace both times): switching `db.ts`'s `ssl: {rejectUnauthorized: false}` to `ssl: true` (Cloudflare's own tutorial pattern), and re-pushing the `DATABASE_URL` secret in case it was stale. Neither changed anything, which is what motivated going below the `pg` layer to the raw socket.
+
+This matches a known, currently-open Cloudflare platform issue — [cloudflare/workers-sdk#3366](https://github.com/cloudflare/workers-sdk/issues/3366), labeled "requires support from the Cloudflare Platform" — where the Workers TCP Socket API's TLS implementation fails against some Postgres TLS cert presentations, Supabase's pooler included. Not fixable from application code.
+
+**Fix:** Cloudflare Hyperdrive — a managed DB-connection proxy purpose-built for this (free tier: 100k queries/day, no credit card). The Worker now connects to Hyperdrive instead of Postgres directly; Hyperdrive performs the real TLS hop to Supabase on Cloudflare's side.
+
+### Task L: switch backend DB connection to Cloudflare Hyperdrive
+
+**Files:**
+- Modify: `backend/wrangler.toml` (add `[[hyperdrive]]` binding)
+- Modify: `backend/src/worker/index.ts` (`Env.DATABASE_URL: string` → `Env.HYPERDRIVE: { connectionString: string }`)
+- Modify: `backend/src/worker/index.test.ts` (`env` fixture shape)
+- Modify: `backend/src/shared/db.ts` (drop the `ssl` option entirely)
+
+**Interfaces:** none change — `db.ts`, `stats.ts`, `logs.ts` still only ever read `process.env.DATABASE_URL`; only what populates that one line in `worker/index.ts` changes.
+
+- [ ] **Step 1:** `npx wrangler hyperdrive create sla-dashboard-db --connection-string="<the same Supabase session-pooler URL already in .dev.vars>"` — prints a Hyperdrive `id` (not a secret; safe to commit).
+- [ ] **Step 2:** Add to `backend/wrangler.toml`:
+
+```toml
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "<id from step 1>"
+```
+
+- [ ] **Step 3:** In `backend/src/worker/index.ts`, change:
+
+```typescript
+export interface Env {
+  HYPERDRIVE: { connectionString: string };
+}
+```
+
+and the line `process.env.DATABASE_URL = env.DATABASE_URL;` to `process.env.DATABASE_URL = env.HYPERDRIVE.connectionString;`.
+
+- [ ] **Step 4:** Update `backend/src/worker/index.test.ts`'s `env` fixture: `const env: Env = { HYPERDRIVE: { connectionString: 'postgres://test' } };`.
+- [ ] **Step 5:** In `backend/src/shared/db.ts`, remove the `ssl` option from the `Client` constructor — Hyperdrive's own example passes none; Hyperdrive terminates the real TLS hop to Postgres itself, so the Worker↔Hyperdrive leg needs no TLS config from application code.
+- [ ] **Step 6:** `cd backend && npm run typecheck && npm test && npm run lint` — expect 42/42 tests passing, both clean.
+- [ ] **Step 7:** `npx wrangler deploy`, then verify against the live database:
+
+```
+curl https://<worker-url>/stats
+curl "https://<worker-url>/logs?page=1&page_size=3"
+curl -X OPTIONS -i https://<worker-url>/stats   # confirm CORS headers from Task H still present
+```
+
+Expect real aggregated stats / paginated log rows back, not an error.
+
+- [ ] **Step 8:** `npx wrangler secret delete DATABASE_URL` — the old raw-connection secret is now dead (nothing reads `env.DATABASE_URL` anymore); removing it keeps the deployed Worker's actual config matching what's documented.
+- [ ] **Step 9: Commit**
+
+```bash
+git add backend/wrangler.toml backend/src/worker/index.ts backend/src/worker/index.test.ts backend/src/shared/db.ts docs/superpowers/plans/2026-09-16-sla-monitoring-dashboard.md docs/superpowers/specs/2026-09-16-sla-monitoring-dashboard-design.md
+git commit -m "fix: connect via Cloudflare Hyperdrive instead of raw TCP/TLS to Postgres"
+```
+
+---
+
 ### Task 20 (MANUAL — first deploy needs your login): Deploy the frontend to Vercel
 
 - [ ] **Step 1:** From `frontend/`, run `vercel login` in your own terminal (opens a browser to authenticate — cannot be done non-interactively).

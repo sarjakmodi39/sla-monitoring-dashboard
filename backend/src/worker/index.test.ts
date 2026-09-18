@@ -10,7 +10,7 @@ import { getServiceStats } from '../query-handler/stats';
 import { getLogs } from '../query-handler/logs';
 import type { Env } from './index';
 
-const env: Env = { DATABASE_URL: 'postgres://test' };
+const env: Env = { HYPERDRIVE: { connectionString: 'postgres://test' } };
 
 describe('worker fetch', () => {
   beforeEach(() => {

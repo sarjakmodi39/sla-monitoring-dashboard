@@ -4,7 +4,7 @@ import { getLogs } from '../query-handler/logs';
 import { getErrorMessage } from '../shared/errors';
 
 export interface Env {
-  DATABASE_URL: string;
+  HYPERDRIVE: { connectionString: string };
 }
 
 const CORS_HEADERS = {
@@ -37,7 +37,7 @@ function parsePositiveInt(value: string | null, fallback: number, name: string):
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    process.env.DATABASE_URL = env.DATABASE_URL;
+    process.env.DATABASE_URL = env.HYPERDRIVE.connectionString;
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
