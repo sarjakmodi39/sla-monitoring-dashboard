@@ -49,15 +49,43 @@ async function parseErrorOrThrow(res: Response): Promise<never> {
   throw new Error(body.error ?? `Request failed with status ${res.status}`);
 }
 
-export async function uploadCsv(file: File): Promise<UploadResponse> {
+export type UploadStage = 'uploading' | 'processing';
+
+export async function uploadCsv(
+  file: File,
+  onStage?: (stage: UploadStage) => void,
+): Promise<UploadResponse> {
   const text = await file.text();
-  const res = await fetch(`${BASE_URL}/upload`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/csv' },
-    body: text,
+
+  return new Promise<UploadResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${BASE_URL}/upload`);
+    xhr.setRequestHeader('Content-Type', 'text/csv');
+
+    // Fires once the browser has finished writing the request body to the
+    // network -- the only signal fetch() doesn't give us -- so the UI can
+    // honestly say "processing" instead of guessing at a timeout.
+    xhr.upload.onload = () => onStage?.('processing');
+
+    xhr.onload = () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        body = {};
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as UploadResponse);
+      } else {
+        reject(new Error((body as { error?: string }).error ?? `Request failed with status ${xhr.status}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+
+    onStage?.('uploading');
+    xhr.send(text);
   });
-  if (!res.ok) return parseErrorOrThrow(res);
-  return res.json();
 }
 
 export async function fetchStats(from?: string, to?: string): Promise<StatsResponse> {

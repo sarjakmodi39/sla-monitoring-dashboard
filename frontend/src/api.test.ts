@@ -8,17 +8,59 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
 });
 
+class FakeXhr {
+  static instances: FakeXhr[] = [];
+  method = '';
+  url = '';
+  status = 200;
+  responseText = '{}';
+  requestBody: unknown;
+  headers: Record<string, string> = {};
+  upload = { onload: null as (() => void) | null };
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  constructor() {
+    FakeXhr.instances.push(this);
+  }
+
+  open(method: string, url: string) {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(key: string, value: string) {
+    this.headers[key] = value;
+  }
+
+  send(body: unknown) {
+    this.requestBody = body;
+  }
+}
+
 describe('api client', () => {
-  it('uploadCsv posts the file text as text/csv and returns the parsed JSON', async () => {
-    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ rows_received: 1 }) } as Response);
+  it('uploadCsv posts the file text as text/csv, signals upload then processing, and returns the parsed JSON', async () => {
+    FakeXhr.instances = [];
+    vi.stubGlobal('XMLHttpRequest', FakeXhr as unknown as typeof XMLHttpRequest);
     const file = new File(['a,b\n1,2'], 'test.csv', { type: 'text/csv' });
+    const stages: string[] = [];
 
-    const result = await uploadCsv(file);
+    const resultPromise = uploadCsv(file, (stage) => stages.push(stage));
+    await vi.waitFor(() => expect(FakeXhr.instances).toHaveLength(1));
+    const xhr = FakeXhr.instances[0];
 
-    expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/upload'),
-      expect.objectContaining({ method: 'POST', headers: { 'Content-Type': 'text/csv' } }),
-    );
+    expect(xhr.method).toBe('POST');
+    expect(xhr.url).toContain('/upload');
+    expect(xhr.headers['Content-Type']).toBe('text/csv');
+    expect(xhr.requestBody).toBe('a,b\n1,2');
+
+    xhr.upload.onload?.();
+    xhr.status = 200;
+    xhr.responseText = JSON.stringify({ rows_received: 1 });
+    xhr.onload?.();
+
+    const result = await resultPromise;
+    expect(stages).toEqual(['uploading', 'processing']);
     expect(result).toEqual({ rows_received: 1 });
   });
 
