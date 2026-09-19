@@ -12,3 +12,4 @@ backend/.wrangler/
 .claude/
 .vercel
 .env*
+docs/interview-qa.md
